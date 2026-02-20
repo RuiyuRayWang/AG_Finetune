@@ -111,7 +111,13 @@ def apply_lora_to_params(
         # A is [d_in, rank], B is [rank, d_out]
         # A @ B = [d_in, d_out] which matches W
         base_weight = merged_params[layer_path]['w']
-        lora_delta = lora_A[layer_path] @ lora_B[layer_path] * scaling
+        
+        # CRITICAL: Compute LoRA delta in float32 for numerical stability
+        # Matrix multiply in bfloat16 can cause NaN gradients during backprop
+        lora_A_f32 = lora_A[layer_path].astype(jnp.float32)
+        lora_B_f32 = lora_B[layer_path].astype(jnp.float32)
+        lora_delta = (lora_A_f32 @ lora_B_f32 * scaling).astype(base_weight.dtype)
+        
         merged_params[layer_path]['w'] = base_weight + lora_delta
     
     return merged_params

@@ -9,9 +9,14 @@ import jax
 import jax.numpy as jnp
 import haiku as hk
 import jmp
+import numpy as np
 from typing import Dict, Tuple, Optional, Callable
+from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
+from jax.experimental import mesh_utils
 from alphagenome_research.model import dna_model, model as alphagenome_model
+from alphagenome_research.model.metadata import metadata as metadata_lib
 import optax
+import orbax.checkpoint as ocp
 
 import sys
 import os
@@ -39,6 +44,10 @@ class LoRAAlphaGenomeModel:
         lora_alpha: float = 16.0,
         target_layers: Optional[list] = None,
         learning_rate: float = 1e-4,
+        mesh: Optional[Mesh] = None,
+        warmup_steps: int = 0,
+        total_steps: int = 0,
+        precision_policy: str = 'params=float32,compute=float32,output=float32',
     ):
         """
         Initialize LoRA model.
@@ -48,7 +57,14 @@ class LoRAAlphaGenomeModel:
             lora_rank: Rank of LoRA matrices (default 8)
             lora_alpha: LoRA scaling factor (default 16)
             target_layers: List of layer paths to apply LoRA. If None, applies to all Q/K/V
-            learning_rate: Learning rate for Adam optimizer
+            learning_rate: Learning rate for Adam optimizer (peak LR if using warmup)
+            mesh: Optional JAX device mesh for multi-GPU training
+            warmup_steps: Number of warmup steps (0 = no warmup)
+            total_steps: Total training steps for cosine decay (0 = constant LR)
+            precision_policy: JMP mixed-precision policy string.
+                             Default: float32 everywhere (safe). Use
+                             'params=float32,compute=bfloat16,output=bfloat16'
+                             only if bf16 NaN issue is confirmed fixed.
         """
         self.base_model = base_model
         self.base_params = base_model._params  # Frozen - will not be modified
@@ -56,6 +72,16 @@ class LoRAAlphaGenomeModel:
         self.device = base_model._device_context._device
         self.metadata = base_model._metadata
         self.num_devices = jax.device_count()
+        self.mesh = mesh
+        self.precision_policy = precision_policy
+        
+        # Setup sharding for parameter replication (data parallelism)
+        if self.mesh is not None:
+            # Replicate parameters across all devices (each device gets full copy)
+            self.param_sharding = NamedSharding(self.mesh, P())
+            print(f"  Setting up parameter replication across {self.num_devices} devices...")
+        else:
+            self.param_sharding = None
         
         # Recreate the forward function from dna_model.create()
         # This is the key to enabling LoRA
@@ -73,11 +99,35 @@ class LoRAAlphaGenomeModel:
             alpha=lora_alpha
         )
         
-        # Setup optimizer with gradient clipping to prevent explosion
-        # Chain: clip gradients -> apply Adam
+        # Replicate parameters across devices for data parallelism
+        if self.param_sharding is not None:
+            print(f"  Replicating base parameters across devices...")
+            self.base_params = jax.device_put(self.base_params, self.param_sharding)
+            print(f"  Replicating base state (BatchNorm, etc.) across devices...")
+            self.base_state = jax.device_put(self.base_state, self.param_sharding)
+            print(f"  Replicating LoRA parameters across devices...")
+            self.lora_params['lora_A'] = jax.device_put(self.lora_params['lora_A'], self.param_sharding)
+            self.lora_params['lora_B'] = jax.device_put(self.lora_params['lora_B'], self.param_sharding)
+        
+        # Setup optimizer with LR schedule + gradient clipping
+        # Use warmup + cosine decay to stabilize sparse signal training
+        if warmup_steps > 0 and total_steps > 0:
+            lr_schedule = optax.warmup_cosine_decay_schedule(
+                init_value=0.0,
+                peak_value=learning_rate,
+                warmup_steps=warmup_steps,
+                decay_steps=total_steps,
+                end_value=learning_rate * 0.1  # Decay to 10% of peak
+            )
+            print(f"  Using LR warmup: {warmup_steps} steps, cosine decay over {total_steps} steps")
+        else:
+            lr_schedule = learning_rate
+        
+        # Chain: clip gradients -> apply Adam with LR schedule
+        # Matching DeepMind's fine-tuning colab: clip_by_global_norm(0.5)
         self.optimizer = optax.chain(
-            optax.clip_by_global_norm(1.0),  # Clip gradients to max norm of 1.0
-            optax.adam(learning_rate)
+            optax.clip_by_global_norm(0.5),
+            optax.adam(lr_schedule)
         )
         trainable_params = {
             'lora_A': self.lora_params['lora_A'],
@@ -108,7 +158,7 @@ class LoRAAlphaGenomeModel:
         """
         Recreate the forward function following dna_model.create() pattern.
         """
-        jmp_policy = jmp.get_policy('params=float32,compute=bfloat16,output=bfloat16')
+        jmp_policy = jmp.get_policy(self.precision_policy)
         
         @hk.transform_with_state
         def _forward(dna_sequence, organism_index):
@@ -210,8 +260,12 @@ class LoRAAlphaGenomeModel:
                 organism_index
             )
             
-            # Compute loss  
-            loss = loss_fn(predictions, targets)
+            # Extract signal from targets dict
+            targets_signal = targets['signal']
+            
+            # Compute loss (loss function handles float32 conversion and all safety checks)
+            loss = loss_fn(predictions, targets_signal)
+            
             return loss, predictions
         
         # Compute loss and gradients
@@ -220,15 +274,40 @@ class LoRAAlphaGenomeModel:
             compute_loss, has_aux=True
         )(lora_trainable)
         
-        # Compute gradient norm for monitoring
-        grad_norm = optax.global_norm(grads)
+        # Check gradient and parameter health (for sentinel codes in returned grad_norm)
+        params_has_nan = jax.tree_util.tree_reduce(
+            lambda acc, x: acc | jnp.any(jnp.isnan(x)), lora_trainable, initializer=jnp.bool_(False)
+        )
+        params_has_inf = jax.tree_util.tree_reduce(
+            lambda acc, x: acc | jnp.any(jnp.isinf(x)), lora_trainable, initializer=jnp.bool_(False)
+        )
+        grad_has_nan = jax.tree_util.tree_reduce(
+            lambda acc, x: acc | jnp.any(jnp.isnan(x)), grads, initializer=jnp.bool_(False)
+        )
+        grad_has_inf = jax.tree_util.tree_reduce(
+            lambda acc, x: acc | jnp.any(jnp.isinf(x)), grads, initializer=jnp.bool_(False)
+        )
+
+        # Gradient norm (pre-clip; NaN/Inf from bad batches will show as sentinel)
+        grad_squares = jax.tree.map(
+            lambda g: jnp.sum(g.astype(jnp.float32) ** 2), grads
+        )
+        grad_norm = jnp.sqrt(
+            jax.tree_util.tree_reduce(jnp.add, grad_squares, initializer=jnp.float32(0.0))
+        )
         
-        # Clip gradients to prevent explosion (max global norm = 1.0)
-        max_norm = 1.0
-        scale = jnp.minimum(1.0, max_norm / (grad_norm + 1e-7))
-        grads = jax.tree.map(lambda g: g * scale, grads)
+        # Return debug info as part of the norm (encode flags in special values)
+        # If params have NaN: return -3.0
+        # If params have Inf: return -4.0
+        # If grads have NaN: return -1.0
+        # If grads have Inf: return -2.0
+        # Otherwise: return computed norm
+        grad_norm = jnp.where(params_has_nan, jnp.float32(-3.0), grad_norm)
+        grad_norm = jnp.where(params_has_inf, jnp.float32(-4.0), grad_norm)
+        grad_norm = jnp.where(grad_has_nan, jnp.float32(-1.0), grad_norm)
+        grad_norm = jnp.where(grad_has_inf, jnp.float32(-2.0), grad_norm)
         
-        # Update LoRA parameters
+        # Update LoRA parameters (optimizer includes gradient clipping)
         updates, new_opt_state = self.optimizer.update(grads, opt_state)
         updated_trainable = optax.apply_updates(lora_trainable, updates)
         
@@ -240,7 +319,7 @@ class LoRAAlphaGenomeModel:
         organism_index: jnp.ndarray,
         targets: Dict,
         loss_fn: Callable
-    ) -> Tuple[float, Dict]:
+    ) -> Tuple[float, Dict, float]:
         """
         Single training step with automatic multi-GPU parallelization.
         
@@ -255,7 +334,7 @@ class LoRAAlphaGenomeModel:
             loss_fn: Loss function(predictions, targets) -> scalar
             
         Returns:
-            (loss_value, predictions)
+            (loss_value, predictions, grad_norm)
         """
         lora_trainable = {
             'lora_A': self.lora_params['lora_A'],
@@ -277,19 +356,221 @@ class LoRAAlphaGenomeModel:
         self.lora_params['lora_B'] = updated_lora_trainable['lora_B']
         self.opt_state = new_opt_state
         
-        return loss_value, predictions
+        return loss_value, predictions, grad_norm
     
-    def save_lora(self, filepath: str):
-        """Save LoRA parameters."""
-        from utils.lora_utils import save_lora_checkpoint
-        save_lora_checkpoint(self.lora_params, filepath)
-    
-    def load_lora(self, filepath: str):
-        """Load LoRA parameters."""
-        from utils.lora_utils import load_lora_checkpoint
-        self.lora_params = load_lora_checkpoint(filepath)
+    def save_lora(self, dirpath: str):
+        """Save LoRA parameters using orbax."""
+        import os, shutil
+        if os.path.exists(dirpath):
+            shutil.rmtree(dirpath)
+        os.makedirs(dirpath, exist_ok=True)
+        checkpointer = ocp.StandardCheckpointer()
+        saveable = {
+            'lora_A': self.lora_params['lora_A'],
+            'lora_B': self.lora_params['lora_B'],
+            'scaling': np.array(self.lora_params['scaling']),
+            'rank': np.array(self.lora_params['rank']),
+            'alpha': np.array(self.lora_params['alpha']),
+        }
+        checkpointer.save(dirpath, saveable)
+        checkpointer.wait_until_finished()
+
+    def load_lora(self, dirpath: str):
+        """Load LoRA parameters using orbax."""
+        checkpointer = ocp.StandardCheckpointer()
+        restored = checkpointer.restore(dirpath)
+        self.lora_params['lora_A'] = restored['lora_A']
+        self.lora_params['lora_B'] = restored['lora_B']
+        self.lora_params['scaling'] = float(restored['scaling'])
+        self.lora_params['rank'] = int(restored['rank'])
+        self.lora_params['alpha'] = float(restored['alpha'])
         trainable_params = {
             'lora_A': self.lora_params['lora_A'],
             'lora_B': self.lora_params['lora_B']
         }
         self.opt_state = self.optimizer.init(trainable_params)
+
+
+# ---------------------------------------------------------------------------
+# Head-Replacement Fine-Tuning
+# ---------------------------------------------------------------------------
+
+class HeadReplaceAlphaGenomeModel:
+    """
+    Full-parameter fine-tuning via head replacement (DeepMind approach).
+
+    Rather than LoRA adapters, this strategy:
+      1. Replaces the pretrained output heads with newly-initialised heads
+         tailored to the target tracks (e.g. one ATAC track for CUT&Tag).
+      2. Keeps the pretrained trunk weights as the initial values.
+      3. Optimises ALL parameters jointly.
+
+    This mirrors the official AlphaGenome fine-tuning colab exactly, except
+    that we use our own PyTorch data pipeline and Borzoi-style loss so the
+    bedgraph/FASTA workflow is unchanged.
+
+    Precision policy is hard-wired to float32 everywhere, which avoids the
+    bfloat16 forward-NaN issue observed in the LoRA experiments.
+    """
+
+    def __init__(
+        self,
+        params: Dict,
+        state: Dict,
+        apply_fn: Callable,
+        mesh: Optional[Mesh] = None,
+        learning_rate: float = 5e-4,
+        warmup_steps: int = 0,
+        total_steps: int = 0,
+    ):
+        """
+        Args:
+            params: Merged parameters (trunk from pretrained + fresh heads).
+            state:  Model state (BatchNorm EMAs from pretrained checkpoint).
+            apply_fn: Callable ``apply_fn(params, state, seq, org) -> predictions``.
+            mesh:   JAX device mesh for data-parallel training (optional).
+            learning_rate: Peak Adam LR.
+            warmup_steps: Warmup steps for cosine schedule (0 = constant LR).
+            total_steps:  Total steps for cosine schedule (0 = constant LR).
+        """
+        self.params = params
+        self.state = state
+        self.apply_fn = apply_fn
+        self.mesh = mesh
+        self.num_devices = jax.device_count()
+
+        # Sharding: replicate params, shard batch dim via input arrays
+        if mesh is not None:
+            self.param_sharding = NamedSharding(mesh, P())
+            print(f"  [HeadReplace] Replicating parameters across {self.num_devices} devices...")
+            self.params = jax.device_put(self.params, self.param_sharding)
+            self.state = jax.device_put(self.state, self.param_sharding)
+        else:
+            self.param_sharding = None
+
+        # LR schedule
+        if warmup_steps > 0 and total_steps > 0:
+            lr_schedule = optax.warmup_cosine_decay_schedule(
+                init_value=0.0,
+                peak_value=learning_rate,
+                warmup_steps=warmup_steps,
+                decay_steps=total_steps,
+                end_value=learning_rate * 0.1,
+            )
+            print(f"  [HeadReplace] LR warmup: {warmup_steps} steps, cosine decay over {total_steps} steps")
+        else:
+            lr_schedule = learning_rate
+
+        # Optimizer — tight clipping matching DeepMind colab
+        self.optimizer = optax.chain(
+            optax.clip_by_global_norm(0.5),
+            optax.adam(lr_schedule),
+        )
+        self.opt_state = self.optimizer.init(self.params)
+
+        # JIT-compiled train step
+        self._train_step_jit = jax.jit(self._train_step, static_argnames=['loss_fn'])
+
+        n_params = sum(x.size for x in jax.tree_util.tree_leaves(self.params))
+        print(f"✓ HeadReplaceAlphaGenomeModel initialized")
+        print(f"  Total trainable params: {n_params:,}")
+        if self.num_devices > 1:
+            print(f"  Multi-GPU: {self.num_devices} devices")
+
+    # ------------------------------------------------------------------
+    # Internal training step (JIT-compiled)
+    # ------------------------------------------------------------------
+
+    def _train_step(
+        self,
+        dna_sequence: jnp.ndarray,
+        organism_index: jnp.ndarray,
+        targets: Dict,
+        params: Dict,
+        state: Dict,
+        opt_state: optax.OptState,
+        loss_fn: Callable,
+    ):
+        def compute_loss(p):
+            predictions = self.apply_fn(p, state, dna_sequence, organism_index)
+            return loss_fn(predictions, targets['signal']), predictions
+
+        (loss_value, predictions), grads = jax.value_and_grad(
+            compute_loss, has_aux=True
+        )(params)
+
+        # Check gradient quality BEFORE sanitization (for sentinel codes)
+        grad_has_nan = jax.tree_util.tree_reduce(
+            lambda acc, x: acc | jnp.any(jnp.isnan(x)), grads, initializer=jnp.bool_(False)
+        )
+        grad_has_inf = jax.tree_util.tree_reduce(
+            lambda acc, x: acc | jnp.any(jnp.isinf(x)), grads, initializer=jnp.bool_(False)
+        )
+        params_has_nan = jax.tree_util.tree_reduce(
+            lambda acc, x: acc | jnp.any(jnp.isnan(x)), params, initializer=jnp.bool_(False)
+        )
+        params_has_inf = jax.tree_util.tree_reduce(
+            lambda acc, x: acc | jnp.any(jnp.isinf(x)), params, initializer=jnp.bool_(False)
+        )
+
+        # Gradient norm (before clip_by_global_norm)
+        grad_squares = jax.tree.map(
+            lambda g: jnp.sum(g.astype(jnp.float32) ** 2), grads
+        )
+        grad_norm = jnp.sqrt(
+            jax.tree_util.tree_reduce(jnp.add, grad_squares, jnp.float32(0.0))
+        )
+
+        # Encode quality flags as sentinel values (same convention as LoRAAlphaGenomeModel)
+        # -1 = grad NaN, -2 = grad Inf, -3 = param NaN, -4 = param Inf
+        grad_norm = jnp.where(params_has_nan, jnp.float32(-3.0), grad_norm)
+        grad_norm = jnp.where(params_has_inf, jnp.float32(-4.0), grad_norm)
+        grad_norm = jnp.where(grad_has_nan,   jnp.float32(-1.0), grad_norm)
+        grad_norm = jnp.where(grad_has_inf,   jnp.float32(-2.0), grad_norm)
+
+        updates, new_opt_state = self.optimizer.update(grads, opt_state, params)
+        new_params = optax.apply_updates(params, updates)
+
+        return loss_value, predictions, new_params, new_opt_state, grad_norm
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def train_step(
+        self,
+        dna_sequence: jnp.ndarray,
+        organism_index: jnp.ndarray,
+        targets: Dict,
+        loss_fn: Callable,
+    ):
+        """Single training step; returns (loss, predictions, grad_norm)."""
+        loss_value, predictions, new_params, new_opt_state, grad_norm = self._train_step_jit(
+            dna_sequence,
+            organism_index,
+            targets,
+            self.params,
+            self.state,
+            self.opt_state,
+            loss_fn,
+        )
+        self.params = new_params
+        self.opt_state = new_opt_state
+        return loss_value, predictions, grad_norm
+
+    def save(self, dirpath: str):
+        """Save full params + optimizer state via orbax."""
+        import os, shutil
+        if os.path.exists(dirpath):
+            shutil.rmtree(dirpath)
+        os.makedirs(dirpath, exist_ok=True)
+        checkpointer = ocp.StandardCheckpointer()
+        checkpointer.save(dirpath, {'params': self.params, 'opt_state': self.opt_state})
+        checkpointer.wait_until_finished()
+
+    def load(self, dirpath: str):
+        """Restore full params + optimizer state via orbax."""
+        checkpointer = ocp.StandardCheckpointer()
+        restored = checkpointer.restore(dirpath)
+        self.params = restored['params']
+        self.opt_state = restored['opt_state']
