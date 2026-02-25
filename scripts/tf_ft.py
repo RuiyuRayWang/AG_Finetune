@@ -531,31 +531,31 @@ def train(
             ds_iter = tf_dataset.as_numpy_iterator()
             
             for batch_idx, batch in enumerate(ds_iter):
-            # Progress indicator for first batch (JAX compilation happens here)
-            if batch_idx == 0:
-                print(f"  Compiling JAX functions (this may take 2-5 minutes on first batch)...")
-                start_time = time.time()
-            
-            # Convert TensorFlow batch to JAX arrays
-            sequences = jnp.array(batch['dna_sequence'], dtype=jnp.float32)
-            organism_ids = jnp.array(batch['organism_index'], dtype=jnp.int32)
-            targets = {'signal': jnp.array(batch['signal'], dtype=jnp.float32)}
-            
-            # Shard batch across devices using JAX automatic parallelization
-            if batch_sharding is not None:
-                # Use jax.device_put to physically shard arrays across devices
-                # JAX will automatically parallelize computation based on this sharding
-                sequences = jax.device_put(sequences, batch_sharding)
-                organism_ids = jax.device_put(organism_ids, organism_sharding)
-                targets = {
-                    'signal': jax.device_put(targets['signal'], signal_sharding)
-                }
-            
-            # Training step (automatically parallelized based on input sharding)
-            loss_value, predictions, grad_norm = model.train_step(
-                sequences, organism_ids, targets, loss_fn
-            )
-            
+                # Progress indicator for first batch (JAX compilation happens here)
+                if batch_idx == 0:
+                    print(f"  Compiling JAX functions (this may take 2-5 minutes on first batch)...")
+                    start_time = time.time()
+                
+                # Convert TensorFlow batch to JAX arrays
+                sequences = jnp.array(batch['dna_sequence'], dtype=jnp.float32)
+                organism_ids = jnp.array(batch['organism_index'], dtype=jnp.int32)
+                targets = {'signal': jnp.array(batch['signal'], dtype=jnp.float32)}
+                
+                # Shard batch across devices using JAX automatic parallelization
+                if batch_sharding is not None:
+                    # Use jax.device_put to physically shard arrays across devices
+                    # JAX will automatically parallelize computation based on this sharding
+                    sequences = jax.device_put(sequences, batch_sharding)
+                    organism_ids = jax.device_put(organism_ids, organism_sharding)
+                    targets = {
+                        'signal': jax.device_put(targets['signal'], signal_sharding)
+                    }
+                
+                # Training step (automatically parallelized based on input sharding)
+                loss_value, predictions, grad_norm = model.train_step(
+                    sequences, organism_ids, targets, loss_fn
+                )
+                
                 # Convert to host scalars for logging
                 loss_value_host = float(jax.device_get(loss_value))
                 grad_norm_host = float(jax.device_get(grad_norm))
