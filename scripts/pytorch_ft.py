@@ -77,6 +77,7 @@ import haiku as hk
 import jmp
 import pandas as pd
 from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
+from jax.experimental import mesh_utils
 from torch.utils.data import DataLoader
 from alphagenome_research.model import dna_model, model as alphagenome_model
 from alphagenome_research.model.metadata import metadata as metadata_lib
@@ -88,6 +89,7 @@ import json
 import csv
 import datetime
 import sys as _sys
+import contextlib
 
 
 def load_config(config_path: str) -> dict:
@@ -254,12 +256,14 @@ def train(
         print(f"Using JAX data parallelism with parameter replication")
         print()
         
-        # Create device mesh for data parallelism
-        mesh = Mesh(jax.devices(), ('batch',))
-        # Shard batch dimension across devices, replicate other dimensions
-        batch_sharding = NamedSharding(mesh, P('batch', None, None))  # for sequences: [batch, seq_len, 4]
-        organism_sharding = NamedSharding(mesh, P('batch'))  # for organism_ids: [batch]
-        signal_sharding = NamedSharding(mesh, P('batch', None))  # for signals: [batch, seq_len]
+        # Create device mesh for data parallelism (official DeepMind approach)
+        devices = mesh_utils.create_device_mesh((num_devices,))
+        mesh = Mesh(devices, axis_names=('data',))
+        # Simplified sharding: only specify first dimension, let JAX infer the rest
+        data_sharding = NamedSharding(mesh, P('data'))
+        batch_sharding = data_sharding  # alias for backward compatibility
+        organism_sharding = data_sharding
+        signal_sharding = data_sharding
     else:
         print("Single GPU mode")
         mesh = None
@@ -420,14 +424,19 @@ def train(
     best_loss = float('inf')
     grad_norms = []
 
-    for epoch in range(epochs):
-        epoch_losses = []
-        grad_norms = []
+    # Wrap training loop in mesh context (CRITICAL for multi-GPU)
+    # This tells JAX the active mesh for all operations inside
+    mesh_context = jax.set_mesh(mesh) if mesh is not None else None
+    
+    with mesh_context if mesh_context is not None else contextlib.nullcontext():
+        for epoch in range(epochs):
+            epoch_losses = []
+            grad_norms = []
 
-        print(f"\nEpoch {epoch + 1}/{epochs}  [strategy={strategy}]")
-        print("-" * 60)
+            print(f"\nEpoch {epoch + 1}/{epochs}  [strategy={strategy}]")
+            print("-" * 60)
 
-        for batch_idx, (sequences, organism_ids, targets) in enumerate(data_loader):
+            for batch_idx, (sequences, organism_ids, targets) in enumerate(data_loader):
             # Progress indicator for first batch (JAX compilation happens here)
             if batch_idx == 0:
                 print(f"  Compiling JAX functions (this may take 2-5 minutes on first batch)...")
@@ -551,37 +560,37 @@ def train(
             # Print progress every 10 batches (or every batch if < 20 total batches)
             print_interval = 1 if len(data_loader) < 20 else 10
             if (batch_idx + 1) % print_interval == 0:
-                avg_loss = sum(epoch_losses[-print_interval:]) / min(print_interval, len(epoch_losses))
-                avg_gn   = sum(grad_norms[-print_interval:]) / max(1, min(print_interval, len(grad_norms)))
-                print(f"  Batch {batch_idx + 1}/{len(data_loader)}: Loss = {avg_loss:.6f}, Grad Norm = {avg_gn:.6f}")
-        
-        # Epoch summary
-        if len(epoch_losses) > 0:
-            avg_epoch_loss = sum(epoch_losses) / len(epoch_losses)
-            print(f"\nEpoch {epoch + 1} Summary:")
-            print(f"  Average Loss: {avg_epoch_loss:.6f}")
-            print(f"  Batches processed: {len(epoch_losses)}")
+                    avg_loss = sum(epoch_losses[-print_interval:]) / min(print_interval, len(epoch_losses))
+                    avg_gn   = sum(grad_norms[-print_interval:]) / max(1, min(print_interval, len(grad_norms)))
+                    print(f"  Batch {batch_idx + 1}/{len(data_loader)}: Loss = {avg_loss:.6f}, Grad Norm = {avg_gn:.6f}")
             
-            # Save best checkpoint (strategy-aware)
-            if avg_epoch_loss < best_loss:
-                best_loss = avg_epoch_loss
-                best_dir = os.path.join(output_dir, 'best_checkpoint')
-                if strategy == 'lora':
-                    model.save_lora(best_dir)
-                else:
-                    model.save(best_dir)
-                print(f"  ✓ Saved best checkpoint (loss={best_loss:.6f}) → {best_dir}")
-        else:
-            print(f"\nEpoch {epoch + 1} Summary:")
-            print(f"  ⚠️  No batches completed (training stopped early due to NaN/Inf)")
-            avg_epoch_loss = float('inf')
-        
-        # Save epoch checkpoint
-        epoch_dir = os.path.join(output_dir, f'epoch_{epoch + 1:03d}')
-        if strategy == 'lora':
-            model.save_lora(epoch_dir)
-        else:
-            model.save(epoch_dir)
+            # Epoch summary
+            if len(epoch_losses) > 0:
+                avg_epoch_loss = sum(epoch_losses) / len(epoch_losses)
+                print(f"\nEpoch {epoch + 1} Summary:")
+                print(f"  Average Loss: {avg_epoch_loss:.6f}")
+                print(f"  Batches processed: {len(epoch_losses)}")
+                
+                # Save best checkpoint (strategy-aware)
+                if avg_epoch_loss < best_loss:
+                    best_loss = avg_epoch_loss
+                    best_dir = os.path.join(output_dir, 'best_checkpoint')
+                    if strategy == 'lora':
+                        model.save_lora(best_dir)
+                    else:
+                        model.save(best_dir)
+                    print(f"  ✓ Saved best checkpoint (loss={best_loss:.6f}) → {best_dir}")
+            else:
+                print(f"\nEpoch {epoch + 1} Summary:")
+                print(f"  ⚠️  No batches completed (training stopped early due to NaN/Inf)")
+                avg_epoch_loss = float('inf')
+            
+            # Save epoch checkpoint
+            epoch_dir = os.path.join(output_dir, f'epoch_{epoch + 1:03d}')
+            if strategy == 'lora':
+                model.save_lora(epoch_dir)
+            else:
+                model.save(epoch_dir)
     
     print("\n" + "="*60)
     print("TRAINING COMPLETE!")

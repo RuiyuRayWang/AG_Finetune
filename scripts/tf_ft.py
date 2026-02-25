@@ -67,6 +67,7 @@ import haiku as hk
 import jmp
 import pandas as pd
 from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
+from jax.experimental import mesh_utils
 from alphagenome_research.model import dna_model, model as alphagenome_model
 from alphagenome_research.model.metadata import metadata as metadata_lib
 from alphagenome_research.io import fasta as fasta_lib
@@ -78,6 +79,7 @@ from dataset.tf_dataset import CutAndTagDataPipelineTF
 import json
 import csv
 import datetime
+import contextlib
 import sys as _sys
 
 
@@ -323,12 +325,14 @@ def train(
         print(f"Using JAX data parallelism with parameter replication")
         print()
         
-        # Create device mesh for data parallelism
-        mesh = Mesh(jax.devices(), ('batch',))
-        # Shard batch dimension across devices, replicate other dimensions
-        batch_sharding = NamedSharding(mesh, P('batch', None, None))  # for sequences: [batch, seq_len, 4]
-        organism_sharding = NamedSharding(mesh, P('batch'))  # for organism_ids: [batch]
-        signal_sharding = NamedSharding(mesh, P('batch', None))  # for signals: [batch, seq_len]
+        # Create device mesh for data parallelism (official DeepMind approach)
+        devices = mesh_utils.create_device_mesh((num_devices,))
+        mesh = Mesh(devices, axis_names=('data',))
+        # Simplified sharding: only specify first dimension, let JAX infer the rest
+        data_sharding = NamedSharding(mesh, P('data'))
+        batch_sharding = data_sharding  # alias for backward compatibility
+        organism_sharding = data_sharding
+        signal_sharding = data_sharding
     else:
         print("Single GPU mode")
         mesh = None
@@ -511,17 +515,22 @@ def train(
     loss_fn = cut_and_tag_loss_baskerville
     best_loss = float('inf')
 
-    for epoch in range(epochs):
-        epoch_losses = []
-        grad_norms = []
+    # Wrap training loop in mesh context (CRITICAL for multi-GPU)
+    # This tells JAX the active mesh for all operations inside
+    mesh_context = jax.set_mesh(mesh) if mesh is not None else None
+    
+    with mesh_context if mesh_context is not None else contextlib.nullcontext():
+        for epoch in range(epochs):
+            epoch_losses = []
+            grad_norms = []
 
-        print(f"\nEpoch {epoch + 1}/{epochs}  [strategy={strategy}]")
-        print("-" * 60)
+            print(f"\nEpoch {epoch + 1}/{epochs}  [strategy={strategy}]")
+            print("-" * 60)
 
-        # Create numpy iterator from TensorFlow dataset
-        ds_iter = tf_dataset.as_numpy_iterator()
-        
-        for batch_idx, batch in enumerate(ds_iter):
+            # Create numpy iterator from TensorFlow dataset
+            ds_iter = tf_dataset.as_numpy_iterator()
+            
+            for batch_idx, batch in enumerate(ds_iter):
             # Progress indicator for first batch (JAX compilation happens here)
             if batch_idx == 0:
                 print(f"  Compiling JAX functions (this may take 2-5 minutes on first batch)...")
@@ -547,70 +556,70 @@ def train(
                 sequences, organism_ids, targets, loss_fn
             )
             
-            # Convert to host scalars for logging
-            loss_value_host = float(jax.device_get(loss_value))
-            grad_norm_host = float(jax.device_get(grad_norm))
-            
-            epoch_losses.append(loss_value_host)
-            grad_norms.append(grad_norm_host)
-            _metrics_writer.writerow([datetime.datetime.now().isoformat(), epoch + 1, batch_idx + 1, loss_value_host, grad_norm_host, False, False])
-            
-            # Log progress
-            if batch_idx == 0:
-                compile_time = time.time() - start_time
-                print(f"  ✓ Compilation complete! Took {compile_time:.1f}s")
+                # Convert to host scalars for logging
+                loss_value_host = float(jax.device_get(loss_value))
+                grad_norm_host = float(jax.device_get(grad_norm))
                 
-                # Visualize array sharding for debugging (multi-GPU only)
-                if batch_sharding is not None:
-                    print(f"\n  Array Sharding Visualization:")
-                    print(f"  Sequences shape: {sequences.shape}")
-                    print(f"  Sequences sharding: {sequences.sharding}")
-                    # Visualize a 2D slice since visualize_array_sharding only supports 1D/2D
-                    try:
-                        print(f"  Sequences[:, 0, 0] (batch dimension):")
-                        jax.debug.visualize_array_sharding(sequences[:, 0, 0])
-                    except Exception as e:
-                        print(f"  (Visualization skipped: {e})")
-                    print(f"  Loss value: {loss_value}")
-                    print(f"  Gradient norm: {grad_norm}")
-                    print()
+                epoch_losses.append(loss_value_host)
+                grad_norms.append(grad_norm_host)
+                _metrics_writer.writerow([datetime.datetime.now().isoformat(), epoch + 1, batch_idx + 1, loss_value_host, grad_norm_host, False, False])
                 
-                print(f"  Training on {steps_per_epoch} batches...")
+                # Log progress
+                if batch_idx == 0:
+                    compile_time = time.time() - start_time
+                    print(f"  ✓ Compilation complete! Took {compile_time:.1f}s")
+                    
+                    # Visualize array sharding for debugging (multi-GPU only)
+                    if batch_sharding is not None:
+                        print(f"\n  Array Sharding Visualization:")
+                        print(f"  Sequences shape: {sequences.shape}")
+                        print(f"  Sequences sharding: {sequences.sharding}")
+                        # Visualize a 2D slice since visualize_array_sharding only supports 1D/2D
+                        try:
+                            print(f"  Sequences[:, 0, 0] (batch dimension):")
+                            jax.debug.visualize_array_sharding(sequences[:, 0, 0])
+                        except Exception as e:
+                            print(f"  (Visualization skipped: {e})")
+                        print(f"  Loss value: {loss_value}")
+                        print(f"  Gradient norm: {grad_norm}")
+                        print()
+                    
+                    print(f"  Training on {steps_per_epoch} batches...")
+                
+                # Print progress every 10 batches (or every batch if < 20 total batches)
+                print_interval = 1 if steps_per_epoch < 20 else 10
+                if (batch_idx + 1) % print_interval == 0:
+                    avg_loss = sum(epoch_losses[-print_interval:]) / min(print_interval, len(epoch_losses))
+                    avg_gn   = sum(grad_norms[-print_interval:]) / max(1, min(print_interval, len(grad_norms)))
+                    print(f"  Batch {batch_idx + 1}/{steps_per_epoch}: Loss = {avg_loss:.6f}, Grad Norm = {avg_gn:.6f}")
             
-            # Print progress every 10 batches (or every batch if < 20 total batches)
-            print_interval = 1 if steps_per_epoch < 20 else 10
-            if (batch_idx + 1) % print_interval == 0:
-                avg_loss = sum(epoch_losses[-print_interval:]) / min(print_interval, len(epoch_losses))
-                avg_gn   = sum(grad_norms[-print_interval:]) / max(1, min(print_interval, len(grad_norms)))
-                print(f"  Batch {batch_idx + 1}/{steps_per_epoch}: Loss = {avg_loss:.6f}, Grad Norm = {avg_gn:.6f}")
-        
-        # Epoch summary
-        if len(epoch_losses) > 0:
-            avg_epoch_loss = sum(epoch_losses) / len(epoch_losses)
-            print(f"\nEpoch {epoch + 1} Summary:")
-            print(f"  Average Loss: {avg_epoch_loss:.6f}")
-            print(f"  Batches processed: {len(epoch_losses)}")
+            # Epoch summary
+            if len(epoch_losses) > 0:
+                avg_epoch_loss = sum(epoch_losses) / len(epoch_losses)
+                print(f"\nEpoch {epoch + 1} Summary:")
+                print(f"  Average Loss: {avg_epoch_loss:.6f}")
+                print(f"  Batches processed: {len(epoch_losses)}")
+                
+                # Save best checkpoint (strategy-aware)
+                if avg_epoch_loss < best_loss:
+                    best_loss = avg_epoch_loss
+                    best_dir = os.path.join(output_dir, 'best_checkpoint')
+                    if strategy == 'lora':
+                        model.save_lora(best_dir)
+                    else:
+                        model.save(best_dir)
+                    print(f"  ✓ Saved best checkpoint (loss={best_loss:.6f}) → {best_dir}")
+            else:
+                print(f"\nEpoch {epoch + 1} Summary:")
+                print(f"  ⚠️  No batches completed (training stopped early due to NaN/Inf)")
+                avg_epoch_loss = float('inf')
             
-            # Save best checkpoint (strategy-aware)
-            if avg_epoch_loss < best_loss:
-                best_loss = avg_epoch_loss
-                best_dir = os.path.join(output_dir, 'best_checkpoint')
-                if strategy == 'lora':
-                    model.save_lora(best_dir)
-                else:
-                    model.save(best_dir)
-                print(f"  ✓ Saved best checkpoint (loss={best_loss:.6f}) → {best_dir}")
-        else:
-            print(f"\nEpoch {epoch + 1} Summary:")
-            print(f"  ⚠️  No batches completed (training stopped early due to NaN/Inf)")
-            avg_epoch_loss = float('inf')
-        
-        # Save epoch checkpoint
-        epoch_dir = os.path.join(output_dir, f'epoch_{epoch + 1:03d}')
-        if strategy == 'lora':
-            model.save_lora(epoch_dir)
-        else:
-            model.save(epoch_dir)
+            # Save epoch checkpoint
+            epoch_dir = os.path.join(output_dir, f'epoch_{epoch + 1:03d}')
+            if strategy == 'lora':
+                model.save_lora(epoch_dir)
+            else:
+                model.save(epoch_dir)
     
     print("\n" + "="*60)
     print("TRAINING COMPLETE!")

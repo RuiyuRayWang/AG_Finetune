@@ -143,23 +143,20 @@ class LoRAAlphaGenomeModel:
             'target_layers': self.lora_params['target_layers']
         }
         
-        # JIT-compile the train step with explicit sharding specifications
-        # This tells JAX exactly what sharding to expect for inputs/outputs
-        # which avoids implicit resharding that can cause NCCL errors
+        # JIT-compile the train step with simplified sharding (official DeepMind approach)
+        # Use P('data') for batch dimension only, let JAX auto-broadcast to input shapes
         if mesh is not None:
-            # Multi-GPU: specify sharding for all inputs and outputs
-            batch_sharding = NamedSharding(mesh, P('batch', None, None))
-            organism_sharding = NamedSharding(mesh, P('batch'))
-            signal_sharding = NamedSharding(mesh, P('batch', None))
+            # Multi-GPU: simplified sharding specs
+            data_sharding = NamedSharding(mesh, P('data'))
             replicated = self.param_sharding
             
             self._train_step_jit = jax.jit(
                 self._train_step,
                 static_argnames=['loss_fn'],
                 in_shardings=(
-                    batch_sharding,      # dna_sequence
-                    organism_sharding,   # organism_index
-                    {'signal': signal_sharding},  # targets dict
+                    data_sharding,       # dna_sequence (auto-broadcasts to [B,S,4])
+                    data_sharding,       # organism_index (auto-broadcasts to [B])
+                    data_sharding,       # targets (auto-broadcasts to shape)
                     {'lora_A': replicated, 'lora_B': replicated},  # trainable_params dict
                     replicated,          # base_params
                     replicated,          # base_state
@@ -167,7 +164,7 @@ class LoRAAlphaGenomeModel:
                 ),
                 out_shardings=(
                     replicated,          # loss_value (scalar, replicated)
-                    None,                # predictions (let JAX infer)
+                    replicated,          # predictions
                     {'lora_A': replicated, 'lora_B': replicated},  # new_trainable_params
                     replicated,          # new_opt_state
                     replicated,          # grad_norm
@@ -506,29 +503,28 @@ class HeadReplaceAlphaGenomeModel:
             self.opt_state = jax.device_put(self.opt_state, self.param_sharding)
 
         # JIT-compiled train step with explicit sharding specifications
-        # This tells JAX exactly what sharding to expect for inputs/outputs
-        # which avoids implicit resharding that can cause NCCL errors
+        # Simplified sharding following official DeepMind approach:
+        # - Use P('data') for batch dimension only, let JAX infer the rest
+        # - This matches the official finetuning notebook exactly
         if mesh is not None:
-            # Multi-GPU: specify sharding for all inputs and outputs
-            batch_sharding = NamedSharding(mesh, P('batch', None, None))
-            organism_sharding = NamedSharding(mesh, P('batch'))
-            signal_sharding = NamedSharding(mesh, P('batch', None))
+            # Multi-GPU: simplified sharding specs
+            data_sharding = NamedSharding(mesh, P('data'))
             replicated = self.param_sharding
             
             self._train_step_jit = jax.jit(
                 self._train_step,
                 static_argnames=['loss_fn'],
                 in_shardings=(
-                    batch_sharding,      # dna_sequence
-                    organism_sharding,   # organism_index
-                    {'signal': signal_sharding},  # targets dict
+                    data_sharding,       # dna_sequence (auto-broadcasts to [B,S,4])
+                    data_sharding,       # organism_index (auto-broadcasts to [B])
+                    data_sharding,       # targets (auto-broadcasts to shape)
                     replicated,          # params
                     replicated,          # state
                     replicated,          # opt_state
                 ),
                 out_shardings=(
                     replicated,          # loss_value (scalar, replicated)
-                    None,                # predictions (let JAX infer)
+                    replicated,          # predictions
                     replicated,          # new_params
                     replicated,          # new_opt_state
                     replicated,          # grad_norm
