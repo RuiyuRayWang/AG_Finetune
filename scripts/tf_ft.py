@@ -66,7 +66,7 @@ import jax.numpy as jnp
 import haiku as hk
 import jmp
 import pandas as pd
-from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
+from jax.sharding import Mesh, PartitionSpec as P
 from jax.experimental import mesh_utils
 from alphagenome_research.model import dna_model, model as alphagenome_model
 from alphagenome_research.model.metadata import metadata as metadata_lib
@@ -328,17 +328,14 @@ def train(
         # Create device mesh for data parallelism (official DeepMind approach)
         devices = mesh_utils.create_device_mesh((num_devices,))
         mesh = Mesh(devices, axis_names=('data',))
-        # Simplified sharding: only specify first dimension, let JAX infer the rest
-        data_sharding = NamedSharding(mesh, P('data'))
-        batch_sharding = data_sharding  # alias for backward compatibility
-        organism_sharding = data_sharding
-        signal_sharding = data_sharding
+        # Use bare PartitionSpec — must be used inside jax.set_mesh() context
+        data_sharding = P('data')
+        replicated_sharding = P()
     else:
         print("Single GPU mode")
         mesh = None
-        batch_sharding = None
-        organism_sharding = None
-        signal_sharding = None
+        data_sharding = None
+        replicated_sharding = None
     
     # Validate window size
     if window_size % 128 != 0:
@@ -418,8 +415,15 @@ def train(
     print(f"   ✓ Model loaded on {base_model._device_context._device}")
 
     # ------------------------------------------------------------------
+    # Model construction + training — wrapped in mesh context (CRITICAL).
+    # Bare P() PartitionSpecs (used in model.__init__ for device_put of params
+    # and in jax.jit in_shardings) require an active jax.set_mesh() context.
+    # This matches the official DeepMind finetuning notebook exactly.
+    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Strategy: head_replace  (DeepMind official approach)
     # ------------------------------------------------------------------
+    mesh_ctx = jax.set_mesh(mesh) if mesh is not None else contextlib.nullcontext()
     if strategy == 'head_replace':
         print(f"\n3. [head_replace] Building new ATAC output head for CUT&Tag...")
         organism_enum = (
@@ -515,11 +519,11 @@ def train(
     loss_fn = cut_and_tag_loss_baskerville
     best_loss = float('inf')
 
-    # Wrap training loop in mesh context (CRITICAL for multi-GPU)
-    # This tells JAX the active mesh for all operations inside
-    mesh_context = jax.set_mesh(mesh) if mesh is not None else None
-    
-    with mesh_context if mesh_context is not None else contextlib.nullcontext():
+    # Wrap training loop in mesh context (CRITICAL for multi-GPU).
+    # bare P() PartitionSpecs in device_put and jax.jit shardings require
+    # an active jax.set_mesh() context. Model __init__ already handles
+    # its own context; here we cover device_put of batches + jit calls.
+    with mesh_ctx:
         for epoch in range(epochs):
             epoch_losses = []
             grad_norms = []
@@ -541,14 +545,12 @@ def train(
                 organism_ids = jnp.array(batch['organism_index'], dtype=jnp.int32)
                 targets = {'signal': jnp.array(batch['signal'], dtype=jnp.float32)}
                 
-                # Shard batch across devices using JAX automatic parallelization
-                if batch_sharding is not None:
-                    # Use jax.device_put to physically shard arrays across devices
-                    # JAX will automatically parallelize computation based on this sharding
-                    sequences = jax.device_put(sequences, batch_sharding)
-                    organism_ids = jax.device_put(organism_ids, organism_sharding)
+                # Shard batch across devices (inside jax.set_mesh() context)
+                if data_sharding is not None:
+                    sequences = jax.device_put(sequences, data_sharding)
+                    organism_ids = jax.device_put(organism_ids, data_sharding)
                     targets = {
-                        'signal': jax.device_put(targets['signal'], signal_sharding)
+                        'signal': jax.device_put(targets['signal'], data_sharding)
                     }
                 
                 # Training step (automatically parallelized based on input sharding)
@@ -570,7 +572,7 @@ def train(
                     print(f"  ✓ Compilation complete! Took {compile_time:.1f}s")
                     
                     # Visualize array sharding for debugging (multi-GPU only)
-                    if batch_sharding is not None:
+                    if data_sharding is not None:
                         print(f"\n  Array Sharding Visualization:")
                         print(f"  Sequences shape: {sequences.shape}")
                         print(f"  Sequences sharding: {sequences.sharding}")

@@ -11,7 +11,7 @@ import haiku as hk
 import jmp
 import numpy as np
 from typing import Dict, Tuple, Optional, Callable
-from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
+from jax.sharding import Mesh, PartitionSpec as P
 from jax.experimental import mesh_utils
 from alphagenome_research.model import dna_model, model as alphagenome_model
 from alphagenome_research.model.metadata import metadata as metadata_lib
@@ -34,7 +34,7 @@ class LoRAAlphaGenomeModel:
     LoRA-enabled AlphaGenome model for parameter-efficient fine-tuning.
     
     This class recreates the model's forward pass to enable LoRA injection.
-    Uses JAX automatic parallelization with NamedSharding for multi-GPU training.
+    Uses JAX automatic parallelization with bare PartitionSpec (P) for multi-GPU training.
     """
     
     def __init__(
@@ -76,9 +76,9 @@ class LoRAAlphaGenomeModel:
         self.precision_policy = precision_policy
         
         # Setup sharding for parameter replication (data parallelism)
+        # Use bare P() — requires jax.set_mesh() context active when device_put is called
         if self.mesh is not None:
-            # Replicate parameters across all devices (each device gets full copy)
-            self.param_sharding = NamedSharding(self.mesh, P())
+            self.param_sharding = P()  # replicated — matches official DeepMind approach
             print(f"  Setting up parameter replication across {self.num_devices} devices...")
         else:
             self.param_sharding = None
@@ -99,15 +99,17 @@ class LoRAAlphaGenomeModel:
             alpha=lora_alpha
         )
         
-        # Replicate parameters across devices for data parallelism
+        # Replicate parameters across devices for data parallelism.
+        # bare P() with device_put requires an active jax.set_mesh() context.
         if self.param_sharding is not None:
-            print(f"  Replicating base parameters across devices...")
-            self.base_params = jax.device_put(self.base_params, self.param_sharding)
-            print(f"  Replicating base state (BatchNorm, etc.) across devices...")
-            self.base_state = jax.device_put(self.base_state, self.param_sharding)
-            print(f"  Replicating LoRA parameters across devices...")
-            self.lora_params['lora_A'] = jax.device_put(self.lora_params['lora_A'], self.param_sharding)
-            self.lora_params['lora_B'] = jax.device_put(self.lora_params['lora_B'], self.param_sharding)
+            with jax.set_mesh(self.mesh):
+                print(f"  Replicating base parameters across devices...")
+                self.base_params = jax.device_put(self.base_params, self.param_sharding)
+                print(f"  Replicating base state (BatchNorm, etc.) across devices...")
+                self.base_state = jax.device_put(self.base_state, self.param_sharding)
+                print(f"  Replicating LoRA parameters across devices...")
+                self.lora_params['lora_A'] = jax.device_put(self.lora_params['lora_A'], self.param_sharding)
+                self.lora_params['lora_B'] = jax.device_put(self.lora_params['lora_B'], self.param_sharding)
         
         # Setup optimizer with LR schedule + gradient clipping
         # Use warmup + cosine decay to stabilize sparse signal training
@@ -143,12 +145,11 @@ class LoRAAlphaGenomeModel:
             'target_layers': self.lora_params['target_layers']
         }
         
-        # JIT-compile the train step with simplified sharding (official DeepMind approach)
-        # Use P('data') for batch dimension only, let JAX auto-broadcast to input shapes
+        # JIT-compile the train step with bare PartitionSpec (official DeepMind approach).
+        # Use P('data') for batch dim, P() for replicated. Requires jax.set_mesh() context.
         if mesh is not None:
-            # Multi-GPU: simplified sharding specs
-            data_sharding = NamedSharding(mesh, P('data'))
-            replicated = self.param_sharding
+            data_sharding = P('data')
+            replicated = self.param_sharding  # P()
             
             self._train_step_jit = jax.jit(
                 self._train_step,
@@ -469,12 +470,15 @@ class HeadReplaceAlphaGenomeModel:
         self.mesh = mesh
         self.num_devices = jax.device_count()
 
-        # Sharding: replicate params, shard batch dim via input arrays
+        # Sharding: replicate params, shard batch dim via input arrays.
+        # bare P() with device_put requires an active jax.set_mesh() context;
+        # we enter the context here so callers don't need to worry about it.
         if mesh is not None:
-            self.param_sharding = NamedSharding(mesh, P())
+            self.param_sharding = P()  # replicated — matches official DeepMind approach
             print(f"  [HeadReplace] Replicating parameters across {self.num_devices} devices...")
-            self.params = jax.device_put(self.params, self.param_sharding)
-            self.state = jax.device_put(self.state, self.param_sharding)
+            with jax.set_mesh(mesh):
+                self.params = jax.device_put(self.params, self.param_sharding)
+                self.state = jax.device_put(self.state, self.param_sharding)
         else:
             self.param_sharding = None
 
@@ -502,14 +506,11 @@ class HeadReplaceAlphaGenomeModel:
         if mesh is not None:
             self.opt_state = jax.device_put(self.opt_state, self.param_sharding)
 
-        # JIT-compiled train step with explicit sharding specifications
-        # Simplified sharding following official DeepMind approach:
-        # - Use P('data') for batch dimension only, let JAX infer the rest
-        # - This matches the official finetuning notebook exactly
+        # JIT-compiled train step with bare PartitionSpec (official DeepMind approach).
+        # Use P('data') for batch dim, P() for replicated. Requires jax.set_mesh() context.
         if mesh is not None:
-            # Multi-GPU: simplified sharding specs
-            data_sharding = NamedSharding(mesh, P('data'))
-            replicated = self.param_sharding
+            data_sharding = P('data')
+            replicated = self.param_sharding  # P()
             
             self._train_step_jit = jax.jit(
                 self._train_step,
