@@ -6,7 +6,7 @@ base-pair resolution (normalized insertion counts, e.g., scaled to 100M per trac
 
 This module provides a PyTorch Dataset for:
 1. Loading genomic sequences from reference FASTA
-2. Loading CUT&Tag signal from BedGraph (base-pair resolution)
+2. Loading CUT&Tag signal from BedGraph or BigWig (base-pair resolution)
 3. Data augmentation (following AlphaGenome training):
    - Shift augmentation: randomly shift windows by ±1024 bp
    - Reverse complementation: 50% probability (sequence + signal)
@@ -41,7 +41,7 @@ class CutAndTagDataset(Dataset):
     def __init__(
         self,
         fasta_path: str,
-        signal_bedgraph: str,  # BedGraph file
+        signal_path: str,  # BedGraph or BigWig file
         genome_windows: Optional[str] = None,  # BED file with training regions
         window_size: int = 262144,  # 2^18, can use smaller than 1Mb for fine-tuning
         organism_id: int = 0,  # 0 = human, 1 = mouse
@@ -53,7 +53,7 @@ class CutAndTagDataset(Dataset):
         
         Args:
             fasta_path: Path to reference genome FASTA
-            signal_bedgraph: Path to CUT&Tag signal (BedGraph format, normalized)
+            signal_path: Path to CUT&Tag signal (BedGraph or BigWig format, normalized)
             genome_windows: Path to BED file with regions to train on (optional)
             window_size: Sequence length in bp (default 262144 = 2^18).
                         AlphaGenome was pretrained on 2^20 (1Mb), but you can
@@ -70,9 +70,10 @@ class CutAndTagDataset(Dataset):
         self.organism_id = organism_id
         self.augment = augment
         self.max_shift = max_shift
+        self.signal_path = signal_path
         
-        # Load signal data
-        self.signal_data = self._load_signal(signal_bedgraph)
+        # Detect file format and load/open signal data
+        self.signal_data, self.signal_format = self._load_signal(signal_path)
         
         # Load training regions
         if genome_windows:
@@ -169,47 +170,67 @@ class CutAndTagDataset(Dataset):
             {'signal': signal}  # dict with np.ndarray [window_size]
         )
 
-    def _load_signal(self, bedgraph_path: str) -> Dict:
-        """Load signal data from BedGraph into a dictionary for fast lookup."""
+    def _load_signal(self, signal_path: str) -> Tuple[Dict, str]:
+        """
+        Load signal data from BedGraph or BigWig file.
+        
+        Returns:
+            (signal_data, format) where:
+                - signal_data: Dict for bedgraph or pyBigWig object for bigwig
+                - format: 'bedgraph' or 'bigwig'
+        """
         import pandas as pd
         
-        print(f"   Loading signal from {bedgraph_path}...")
+        print(f"   Loading signal from {signal_path}...")
         
-        # Read BedGraph format: chr start end value
-        df = pd.read_csv(
-            bedgraph_path,
-            sep='\t',
-            header=None,
-            names=['chrom', 'start', 'end', 'score'],
-            comment='#'
-        )
-        
-        # Check for NaN/Inf in ALL columns (not just score)
-        initial_rows = len(df)
-        
-        # Remove rows with NaN in any column
-        df = df.dropna()
-        
-        # Remove rows with Inf in numeric columns
-        df = df[np.isfinite(df['start']) & np.isfinite(df['end']) & np.isfinite(df['score'])]
-        
-        # Ensure start/end are integers
-        df['start'] = df['start'].astype(int)
-        df['end'] = df['end'].astype(int)
-        
-        rows_removed = initial_rows - len(df)
-        if rows_removed > 0:
-            print(f"   ⚠️  WARNING: Removed {rows_removed:,} rows containing NaN/Inf values")
-            print(f"   Kept {len(df):,} valid rows")
-        
-        # Organize by chromosome for faster lookup
-        signal_dict = {}
-        for chrom in df['chrom'].unique():
-            chrom_df = df[df['chrom'] == chrom].sort_values('start')
-            signal_dict[chrom] = chrom_df
-        
-        print(f"   ✓ Loaded signal for {len(signal_dict)} chromosomes")
-        return signal_dict
+        # Detect format by file extension
+        if signal_path.endswith(('.bw', '.bigWig', '.bigwig')):
+            # BigWig format - use pyBigWig for efficient random access
+            try:
+                import pyBigWig
+                bw = pyBigWig.open(signal_path)
+                print(f"   ✓ Opened BigWig file with {len(bw.chroms())} chromosomes")
+                return bw, 'bigwig'
+            except ImportError:
+                raise ImportError(
+                    "pyBigWig is required for BigWig files. Install with: pip install pyBigWig"
+                )
+        else:
+            # BedGraph format - load into memory for fast lookup
+            df = pd.read_csv(
+                signal_path,
+                sep='\t',
+                header=None,
+                names=['chrom', 'start', 'end', 'score'],
+                comment='#'
+            )
+            
+            # Check for NaN/Inf in ALL columns (not just score)
+            initial_rows = len(df)
+            
+            # Remove rows with NaN in any column
+            df = df.dropna()
+            
+            # Remove rows with Inf in numeric columns
+            df = df[np.isfinite(df['start']) & np.isfinite(df['end']) & np.isfinite(df['score'])]
+            
+            # Ensure start/end are integers
+            df['start'] = df['start'].astype(int)
+            df['end'] = df['end'].astype(int)
+            
+            rows_removed = initial_rows - len(df)
+            if rows_removed > 0:
+                print(f"   ⚠️  WARNING: Removed {rows_removed:,} rows containing NaN/Inf values")
+                print(f"   Kept {len(df):,} valid rows")
+            
+            # Organize by chromosome for faster lookup
+            signal_dict = {}
+            for chrom in df['chrom'].unique():
+                chrom_df = df[df['chrom'] == chrom].sort_values('start')
+                signal_dict[chrom] = chrom_df
+            
+            print(f"   ✓ Loaded BedGraph signal for {len(signal_dict)} chromosomes")
+            return signal_dict, 'bedgraph'
     
     def _load_regions(self, bed_path: str) -> list:
         """
@@ -348,35 +369,57 @@ class CutAndTagDataset(Dataset):
         """
         Get CUT&Tag signal for a genomic window.
         
+        Supports both BedGraph (in-memory lookup) and BigWig (on-demand query).
+        
         Returns: array of shape [window_size] with signal values
         """
-        # Initialize signal array
-        signal = np.zeros(end - start, dtype=np.float32)
+        length = end - start
         
-        # Get signal data for this chromosome
-        if chrom not in self.signal_data:
-            return signal  # Return zeros if no data for this chromosome
-        
-        chrom_signal = self.signal_data[chrom]
-        
-        # Find overlapping regions
-        overlaps = chrom_signal[
-            (chrom_signal['end'] > start) & (chrom_signal['start'] < end)
-        ]
-        
-        # Fill in signal values
-        for _, row in overlaps.iterrows():
-            sig_start = max(0, row['start'] - start)
-            sig_end = min(end - start, row['end'] - start)
-            score = row['score']
-            # Safety: replace NaN/Inf with 0
-            if not np.isfinite(score):
-                score = 0.0
-            signal[sig_start:sig_end] = score
-        
-        # Final safety check: ensure no NaN/Inf in output
-        signal = np.where(np.isfinite(signal), signal, 0.0)
-        
+        if self.signal_format == 'bigwig':
+            # Query BigWig directly (efficient for random access)
+            try:
+                values = self.signal_data.values(chrom, start, end)
+                if values is None:
+                    return np.zeros(length, dtype=np.float32)
+                signal = np.array(values, dtype=np.float32)
+                # Replace NaNs with 0
+                signal = np.nan_to_num(signal, nan=0.0, posinf=0.0, neginf=0.0)
+                return signal
+            except Exception:
+                # Chromosome not found or other error
+                return np.zeros(length, dtype=np.float32)
+        else:
+            # BedGraph format - use in-memory lookup
+            signal = np.zeros(length, dtype=np.float32)
+            
+            if chrom not in self.signal_data:
+                return signal  # Return zeros if no data for this chromosome
+            
+            chrom_signal = self.signal_data[chrom]
+            
+            # Find overlapping regions
+            overlaps = chrom_signal[
+                (chrom_signal['end'] > start) & (chrom_signal['start'] < end)
+            ]
+            
+            # Fill in signal values
+            for _, row in overlaps.iterrows():
+                sig_start = max(0, row['start'] - start)
+                sig_end = min(end - start, row['end'] - start)
+                score = row['score']
+                # Safety: replace NaN/Inf with 0
+                if not np.isfinite(score):
+                    score = 0.0
+                signal[sig_start:sig_end] = score
+            
+            # Final safety check: ensure no NaN/Inf in output
+            signal = np.where(np.isfinite(signal), signal, 0.0)
+
+        # Hard cap against data corruption / integer overflow artifacts.
+        # Bedgraph values are normalised to 100M insertions; >50 000 per bp
+        # is physically impossible and indicates a pipeline artifact.
+        signal = np.clip(signal, 0.0, 50000.0)
+
         # Return raw signal (no log1p transform)
         # AlphaGenome/Borzoi loss handles scaling via targets_scaling function
         # which normalizes by track mean and applies smooth clipping

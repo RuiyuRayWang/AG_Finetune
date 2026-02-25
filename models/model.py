@@ -143,9 +143,39 @@ class LoRAAlphaGenomeModel:
             'target_layers': self.lora_params['target_layers']
         }
         
-        # JIT-compile the train step (JAX will automatically parallelize based on input sharding)
-        # Mark loss_fn as static since it's a Python function, not a JAX array
-        self._train_step_jit = jax.jit(self._train_step, static_argnames=['loss_fn'])
+        # JIT-compile the train step with explicit sharding specifications
+        # This tells JAX exactly what sharding to expect for inputs/outputs
+        # which avoids implicit resharding that can cause NCCL errors
+        if mesh is not None:
+            # Multi-GPU: specify sharding for all inputs and outputs
+            batch_sharding = NamedSharding(mesh, P('batch', None, None))
+            organism_sharding = NamedSharding(mesh, P('batch'))
+            signal_sharding = NamedSharding(mesh, P('batch', None))
+            replicated = self.param_sharding
+            
+            self._train_step_jit = jax.jit(
+                self._train_step,
+                static_argnames=['loss_fn'],
+                in_shardings=(
+                    batch_sharding,      # dna_sequence
+                    organism_sharding,   # organism_index
+                    {'signal': signal_sharding},  # targets dict
+                    {'lora_A': replicated, 'lora_B': replicated},  # trainable_params dict
+                    replicated,          # base_params
+                    replicated,          # base_state
+                    replicated,          # opt_state
+                ),
+                out_shardings=(
+                    replicated,          # loss_value (scalar, replicated)
+                    None,                # predictions (let JAX infer)
+                    {'lora_A': replicated, 'lora_B': replicated},  # new_trainable_params
+                    replicated,          # new_opt_state
+                    replicated,          # grad_norm
+                )
+            )
+        else:
+            # Single-GPU: no sharding needed
+            self._train_step_jit = jax.jit(self._train_step, static_argnames=['loss_fn'])
         
         print(f"✓ LoRA model initialized")
         print(f"  Base model params: {self._count_params(self.base_params):,}")
@@ -351,10 +381,13 @@ class LoRAAlphaGenomeModel:
             loss_fn
         )
         
-        # Update internal state
-        self.lora_params['lora_A'] = updated_lora_trainable['lora_A']
-        self.lora_params['lora_B'] = updated_lora_trainable['lora_B']
-        self.opt_state = new_opt_state
+        # Only commit the update when gradients/params are clean.
+        # A negative grad_norm encodes a sentinel (NaN/Inf detected); applying
+        # NaN gradients would silently corrupt self.params for all future batches.
+        if float(grad_norm) >= 0:
+            self.lora_params['lora_A'] = updated_lora_trainable['lora_A']
+            self.lora_params['lora_B'] = updated_lora_trainable['lora_B']
+            self.opt_state = new_opt_state
         
         return loss_value, predictions, grad_norm
     
@@ -467,9 +500,43 @@ class HeadReplaceAlphaGenomeModel:
             optax.adam(lr_schedule),
         )
         self.opt_state = self.optimizer.init(self.params)
+        
+        # Also replicate optimizer state for multi-GPU
+        if mesh is not None:
+            self.opt_state = jax.device_put(self.opt_state, self.param_sharding)
 
-        # JIT-compiled train step
-        self._train_step_jit = jax.jit(self._train_step, static_argnames=['loss_fn'])
+        # JIT-compiled train step with explicit sharding specifications
+        # This tells JAX exactly what sharding to expect for inputs/outputs
+        # which avoids implicit resharding that can cause NCCL errors
+        if mesh is not None:
+            # Multi-GPU: specify sharding for all inputs and outputs
+            batch_sharding = NamedSharding(mesh, P('batch', None, None))
+            organism_sharding = NamedSharding(mesh, P('batch'))
+            signal_sharding = NamedSharding(mesh, P('batch', None))
+            replicated = self.param_sharding
+            
+            self._train_step_jit = jax.jit(
+                self._train_step,
+                static_argnames=['loss_fn'],
+                in_shardings=(
+                    batch_sharding,      # dna_sequence
+                    organism_sharding,   # organism_index
+                    {'signal': signal_sharding},  # targets dict
+                    replicated,          # params
+                    replicated,          # state
+                    replicated,          # opt_state
+                ),
+                out_shardings=(
+                    replicated,          # loss_value (scalar, replicated)
+                    None,                # predictions (let JAX infer)
+                    replicated,          # new_params
+                    replicated,          # new_opt_state
+                    replicated,          # grad_norm
+                )
+            )
+        else:
+            # Single-GPU: no sharding needed
+            self._train_step_jit = jax.jit(self._train_step, static_argnames=['loss_fn'])
 
         n_params = sum(x.size for x in jax.tree_util.tree_leaves(self.params))
         print(f"✓ HeadReplaceAlphaGenomeModel initialized")
@@ -499,37 +566,14 @@ class HeadReplaceAlphaGenomeModel:
             compute_loss, has_aux=True
         )(params)
 
-        # Check gradient quality BEFORE sanitization (for sentinel codes)
-        grad_has_nan = jax.tree_util.tree_reduce(
-            lambda acc, x: acc | jnp.any(jnp.isnan(x)), grads, initializer=jnp.bool_(False)
-        )
-        grad_has_inf = jax.tree_util.tree_reduce(
-            lambda acc, x: acc | jnp.any(jnp.isinf(x)), grads, initializer=jnp.bool_(False)
-        )
-        params_has_nan = jax.tree_util.tree_reduce(
-            lambda acc, x: acc | jnp.any(jnp.isnan(x)), params, initializer=jnp.bool_(False)
-        )
-        params_has_inf = jax.tree_util.tree_reduce(
-            lambda acc, x: acc | jnp.any(jnp.isinf(x)), params, initializer=jnp.bool_(False)
-        )
-
-        # Gradient norm (before clip_by_global_norm)
-        grad_squares = jax.tree.map(
-            lambda g: jnp.sum(g.astype(jnp.float32) ** 2), grads
-        )
-        grad_norm = jnp.sqrt(
-            jax.tree_util.tree_reduce(jnp.add, grad_squares, jnp.float32(0.0))
-        )
-
-        # Encode quality flags as sentinel values (same convention as LoRAAlphaGenomeModel)
-        # -1 = grad NaN, -2 = grad Inf, -3 = param NaN, -4 = param Inf
-        grad_norm = jnp.where(params_has_nan, jnp.float32(-3.0), grad_norm)
-        grad_norm = jnp.where(params_has_inf, jnp.float32(-4.0), grad_norm)
-        grad_norm = jnp.where(grad_has_nan,   jnp.float32(-1.0), grad_norm)
-        grad_norm = jnp.where(grad_has_inf,   jnp.float32(-2.0), grad_norm)
-
+        # Apply optimizer update (includes gradient clipping and AllReduce for multi-GPU)
         updates, new_opt_state = self.optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
+        
+        # Compute gradient norm (use device_get to avoid potential NCCL issues)
+        grad_norm = jnp.sqrt(
+            sum(jnp.sum(jnp.square(g)) for g in jax.tree_util.tree_leaves(grads))
+        )
 
         return loss_value, predictions, new_params, new_opt_state, grad_norm
 
@@ -554,23 +598,40 @@ class HeadReplaceAlphaGenomeModel:
             self.opt_state,
             loss_fn,
         )
+        # Always apply updates (NaN/Inf checking moved to Python side in finetune.py)
         self.params = new_params
         self.opt_state = new_opt_state
         return loss_value, predictions, grad_norm
 
     def save(self, dirpath: str):
-        """Save full params + optimizer state via orbax."""
+        """Save params and state via orbax (compatible with dna_model.create()).
+        
+        Note: This saves only params and state, NOT opt_state. This format is compatible
+        with AlphaGenome's dna_model.create() API for loading fine-tuned checkpoints.
+        The optimizer state will be reinitialized when resuming training.
+        """
         import os, shutil
         if os.path.exists(dirpath):
             shutil.rmtree(dirpath)
-        os.makedirs(dirpath, exist_ok=True)
         checkpointer = ocp.StandardCheckpointer()
-        checkpointer.save(dirpath, {'params': self.params, 'opt_state': self.opt_state})
+        checkpointer.save(
+            dirpath,
+            args=ocp.args.StandardSave({
+                'params': self.params,
+                'state': self.state,
+            })
+        )
         checkpointer.wait_until_finished()
 
     def load(self, dirpath: str):
-        """Restore full params + optimizer state via orbax."""
+        """Restore params and state via orbax (compatible with dna_model.create()).
+        
+        Note: This restores only params and state. The optimizer state is reinitialized
+        from scratch, so training will start with a fresh optimizer state.
+        """
         checkpointer = ocp.StandardCheckpointer()
         restored = checkpointer.restore(dirpath)
         self.params = restored['params']
-        self.opt_state = restored['opt_state']
+        self.state = restored['state']
+        # Reinitialize optimizer state with current parameters
+        self.opt_state = self.optimizer.init(self.params)

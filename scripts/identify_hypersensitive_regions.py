@@ -402,7 +402,7 @@ def main():
         print(f"  Or use safe windows: {args.output_safe}")
         print()
         print("Example training command:")
-        print("  python scripts/train_lora.py \\")
+        print("  python scripts/train.py \\")
         print("    --genome-windows", args.output_safe, "\\")
         print("    ...")
     print("="*80)

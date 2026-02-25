@@ -1,0 +1,46 @@
+# Example: D1MSN H3K27ac Fine-tuning with Head Replacement
+# 
+# This is an example configuration for fine-tuning AlphaGenome on D1 MSN
+# CUT&Tag H3K27ac data using the head_replace strategy.
+#
+# Usage:
+#   python scripts/train.py --config configs/example_d1msn_h3k27ac.yaml
+
+# ============================================================================
+# STRATEGY
+# ============================================================================
+strategy: head_replace  # Full fine-tuning with new ATAC head
+precision_policy: params=float32,compute=float32,output=float32
+
+# ============================================================================
+# PATHS
+# ============================================================================
+checkpoint: /home/ray/AG_Finetune/checkpoints/pre_trained/alphagenome-all-folds
+fasta: /home/ray/AG_Finetune/data/resources/mm10.fa
+signal: /home/ray/AG_Finetune/data/CUTTag/processed_bedgraph/D1MSN_H3K27ac_averaged_normalized.bedgraph
+output: /home/ray/AG_Finetune/checkpoints/fine_tuned_d1msn_h3k27ac
+
+# Use safe windows to avoid hypersensitive regions
+windows_bed: /home/ray/AG_Finetune/exports/peak_safe_windows/D1MSN_H3K27ac_merged_peak_safe_windows.bed
+
+# ============================================================================
+# TRAINING HYPERPARAMETERS
+# ============================================================================
+epochs: 10
+batch_size: 8  # Across 8 GPUs = 1 sample per GPU
+learning_rate: 5e-4  # Standard for head_replace
+
+# ============================================================================
+# DATA & AUGMENTATION
+# ============================================================================
+window_size: 131072  # 2^17 bp (smaller than pretraining 1Mb for memory efficiency)
+organism_id: 1  # Mouse
+
+# AlphaGenome-style augmentation
+augment: true
+max_shift: 1024  # ±1024 bp shift augmentation
+
+# ============================================================================
+# SYSTEM
+# ============================================================================
+num_workers: 0  # Main process only (recommended for JAX)
