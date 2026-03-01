@@ -1,0 +1,62 @@
+# AlphaGenome Fine-tuning Configuration — Hybrid Head+LoRA Curriculum
+#
+# Two-phase training strategy implemented in tf_ft_hybrid.py:
+#
+#   Phase 1  (first `freeze_epochs` epochs)  — Head only
+#     Trunk is fully frozen.  Only the new ATAC head (~9 K params) is
+#     optimised.  Per-step time: ~0.15 s.  Loss converges quickly.
+#
+#   Phase 2  (remaining epochs)  — Head + LoRA
+#     Trunk base weights stay frozen.  Low-rank A/B matrices are added to
+#     the Q/K/V projections of all 9 transformer blocks (~428 K params at
+#     rank 8) and trained jointly with the head.  Trunk is never mutated
+#     directly — LoRA deltas are merged only at save/inference time.
+#     Per-step time is intermediate; far fewer params than full training.
+#
+# Usage:
+#   LD_PRELOAD=/home/ray/miniforge3/envs/alphagenome/lib/python3.11/site-packages/nvidia/nccl/lib/libnccl.so.2 \
+#       python scripts/tf_ft_hybrid.py --config configs/config_bigwig_hybrid.yaml
+
+
+# PATHS (Required)
+checkpoint: /home/ray/AG_Finetune/checkpoints/pre_trained/alphagenome-all-folds
+fasta: /home/ray/AG_Finetune/data/resources/mm10.fa
+signal: /home/ray/AG_Finetune/data/CUTTag/ZHY-250227-1/ZHY-250227-1_ACTGCATATAAGGCGA/alignment/bigwig/ZHY-250227-1_ACTGCATATAAGGCGA_bowtie2.chrombpnet_reads_to_bw_unstranded.bw
+output: /home/ray/AG_Finetune/checkpoints/fine_tuned
+
+## Optional: BED file with specific genomic windows to use for training
+## STRONGLY RECOMMENDED: Use safe windows to avoid hypersensitive artifact regions
+## If not provided, non-overlapping windows are generated from chrom_sizes (whole-genome mode)
+windows_bed:
+# windows_bed: /home/ray/AG_Finetune/exports/peak_safe_windows/D1MSN_H3K27ac_merged_peak_safe_windows.bed  # Disabled
+
+## Required when windows_bed is omitted (whole-genome mode)
+chrom_sizes: /home/ray/AG_Finetune/data/resources/mm10.chrom.sizes
+
+
+# PRECISION
+precision_policy: params=float32,compute=float32,output=float32
+
+
+# TRAINING HYPERPARAMETERS
+epochs: 10
+freeze_epochs: 2        # Phase 1 length: epochs to keep trunk fully frozen
+batch_size: 8
+learning_rate: 5e-4     # Peak LR used in both phases
+checkpoint_interval: 20   # Mid-epoch checkpoint every N steps. Set 0 to disable.
+
+
+# LORA CONFIGURATION (Phase 2)
+lora_rank: 8            # LoRA rank — increase to 32/64 if Phase 2 plateaus early
+lora_alpha: 16.0        # LoRA alpha scaling factor (effective LR = alpha/rank = 2.0)
+
+
+# DATA & AUGMENTATION
+window_size: 131072     # 2^17 bp
+organism_id: 1          # 0=human, 1=mouse
+augment: true
+max_shift: 1024
+
+
+# SYSTEM
+num_workers: 0

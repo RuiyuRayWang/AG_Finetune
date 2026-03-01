@@ -5,6 +5,9 @@
         },
         {
             "path": "../alphagenome_research"
+        },
+        {
+            "path": "../../../celestial/ray/ARCHIVED/AG_Finetune"
         }
     ]
 }

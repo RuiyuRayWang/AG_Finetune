@@ -49,6 +49,7 @@ import numpy as np
 from pathlib import Path
 from typing import Dict, List, Tuple, Iterator, Any, Mapping
 from functools import partial
+import itertools
 import yaml
 import shutil
 import time
@@ -56,15 +57,27 @@ import time
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# ── Suppress noisy C++ (glog) rendezvous warnings ─────────────────────────
+# The "acquire clique" E-level messages from rendezvous.cc are false positives:
+# the thread self-resolves and prints "Thread is unstuck!" immediately after.
+# These fire during normal compute time (the 28s/step is real forward+backward
+# on 403M params, not a stall). GLOG levels: 0=INFO 1=WARNING 2=ERROR 3=FATAL.
+os.environ.setdefault('GLOG_minloglevel', '3')
+# ────────────────────────────────────────────────────────────────────────────
+
 # TensorFlow: CPU only (for data loading), JAX handles training
 import tensorflow as tf
 tf.config.set_visible_devices([], 'GPU')
 tf.config.set_visible_devices([], 'TPU')
 
 import jax
+jax.config.update('jax_compilation_cache_dir',
+                  '/home/ray/AG_Finetune/.jax_cache')
+jax.config.update('jax_persistent_cache_min_compile_time_secs', 5)
 import jax.numpy as jnp
 import haiku as hk
 import jmp
+import optax
 import pandas as pd
 from jax.sharding import Mesh, PartitionSpec as P
 from jax.experimental import mesh_utils
@@ -148,18 +161,30 @@ class CutAndTagDataPipeline:
         self.organism_id = organism_id
         self.one_hot_encoder = one_hot_encoder.DNAOneHotEncoder()
         
-        # Load training windows from BED file
-        print(f"   Loading training windows from {windows_bed}...")
-        self.intervals = pd.read_csv(
-            windows_bed,
-            sep='\t',
-            header=None,
-            names=['chrom', 'start', 'end'],
-            comment='#'
-        )
-        self.intervals['start'] = self.intervals['start'].astype(int)
-        self.intervals['end'] = self.intervals['end'].astype(int)
-        print(f"   ✓ Loaded {len(self.intervals)} training windows")
+        # Load or generate training windows
+        if windows_bed is not None:
+            print(f"   Loading training windows from {windows_bed}...")
+            self.intervals = pd.read_csv(
+                windows_bed,
+                sep='\t',
+                header=None,
+                names=['chrom', 'start', 'end'],
+                comment='#'
+            )
+            self.intervals['start'] = self.intervals['start'].astype(int)
+            self.intervals['end'] = self.intervals['end'].astype(int)
+            print(f"   ✓ Loaded {len(self.intervals)} training windows")
+        else:
+            if chrom_sizes_path is None:
+                raise ValueError(
+                    "Either windows_bed or chrom_sizes_path must be provided "
+                    "when windows_bed is None."
+                )
+            print(f"   No windows_bed provided — generating whole-genome windows "
+                  f"from {chrom_sizes_path}...")
+            self.intervals = generate_genome_windows(chrom_sizes_path, window_size)
+            print(f"   ✓ Generated {len(self.intervals):,} whole-genome windows "
+                  f"({window_size:,} bp, non-overlapping)")
     
     def get_element(self, idx: int) -> Dict[str, Any]:
         """Get a single training example."""
@@ -230,6 +255,42 @@ class CutAndTagDataPipeline:
         self.signal_extractor.close()
 
 
+def generate_genome_windows(
+    chrom_sizes_path: str,
+    window_size: int,
+    stride: int = None,
+) -> pd.DataFrame:
+    """
+    Generate non-overlapping windows across all canonical chromosomes.
+
+    Only keeps chromosomes matching chr[0-9XY]+ (skips alt/random/chrM contigs)
+    and large enough to contain at least one full window.
+
+    Args:
+        chrom_sizes_path: Path to a 2-column TSV (chrom\tsize).
+        window_size: Window length in bp.
+        stride: Step between window starts. Defaults to window_size (non-overlapping).
+
+    Returns:
+        DataFrame with columns ['chrom', 'start', 'end'].
+    """
+    if stride is None:
+        stride = window_size
+    chrom_sizes = pd.read_csv(
+        chrom_sizes_path, sep='\t', header=None, names=['chrom', 'size']
+    )
+    canonical = chrom_sizes[
+        chrom_sizes['chrom'].str.match(r'^chr[0-9XY]+$') &
+        (chrom_sizes['size'] >= window_size)
+    ]
+    rows = []
+    for _, row in canonical.iterrows():
+        chrom, size = row['chrom'], int(row['size'])
+        for start in range(0, size - window_size + 1, stride):
+            rows.append({'chrom': chrom, 'start': start, 'end': start + window_size})
+    return pd.DataFrame(rows)
+
+
 def pearson_correlation(predictions: jnp.ndarray, targets: jnp.ndarray) -> float:
     """Compute Pearson correlation coefficient."""
     pred_mean = jnp.mean(predictions)
@@ -264,6 +325,7 @@ def train(
     precision_policy: str = 'params=float32,compute=float32,output=float32',
     config_path: str = None,
     chrom_sizes_path: str = None,
+    checkpoint_interval: int = 500,
 ):
     """
     Fine-tune AlphaGenome on CUT&Tag data using TensorFlow data loading.
@@ -313,6 +375,17 @@ def train(
     _metrics_writer = csv.writer(_metrics_file)
     if os.path.getsize(metrics_path) == 0:
         _metrics_writer.writerow(['timestamp', 'epoch', 'batch', 'loss', 'grad_norm', 'nan_event', 'skipped'])
+
+    # Redirect C++ stderr (rendezvous.cc false-positive warnings) to a file.
+    # glog reads GLOG_minloglevel at C++ static-init time, before Python runs,
+    # so os.environ has no effect. File-descriptor-level redirect is the only
+    # reliable way to suppress these from the terminal.
+    _stderr_log_path = os.path.join(output_dir, 'stderr.log')
+    _stderr_log_fd   = os.open(_stderr_log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    _saved_stderr_fd = os.dup(2)
+    os.dup2(_stderr_log_fd, 2)
+    os.close(_stderr_log_fd)
+    print(f"[log] stderr  → {_stderr_log_path}")
     # ----------------------------------------------------------------------
 
     num_devices = jax.device_count()
@@ -365,13 +438,11 @@ def train(
     signal_format = "BigWig" if signal_path.endswith(('.bigwig', '.bw')) else "BedGraph"
     print(f"Signal format: {signal_format} (auto-detected from extension)")
     
-    # Validate required arguments for TensorFlow pipeline
-    if not genome_windows:
-        raise ValueError(
-            "genome_windows (--windows-bed) is REQUIRED for TensorFlow data pipeline. "
-            "Use safe windows: exports/peak_safe_windows/D1MSN_H3K27ac_merged_peak_safe_windows.bed"
-        )
-    genome_windows = os.path.abspath(genome_windows)
+    # Resolve genome_windows path if provided
+    if genome_windows:
+        genome_windows = os.path.abspath(genome_windows)
+    else:
+        print("   Note: windows_bed not set — whole-genome windows will be generated from chrom_sizes")
 
     # ------------------------------------------------------------------
     # Data pipeline — TensorFlow dataset (following DeepMind approach)
@@ -415,10 +486,9 @@ def train(
     print(f"   ✓ Model loaded on {base_model._device_context._device}")
 
     # ------------------------------------------------------------------
-    # Model construction + training — wrapped in mesh context (CRITICAL).
-    # Bare P() PartitionSpecs (used in model.__init__ for device_put of params
-    # and in jax.jit in_shardings) require an active jax.set_mesh() context.
-    # This matches the official DeepMind finetuning notebook exactly.
+    # Model construction (outside mesh context — no device_put happens here).
+    # params/state/opt_state stay as plain arrays; they are materialised as
+    # replicated by in_shardings=P() in jax.jit on the first training call.
     # ------------------------------------------------------------------
     # ------------------------------------------------------------------
     # Strategy: head_replace  (DeepMind official approach)
@@ -456,10 +526,10 @@ def train(
             )
             return predictions
 
-        print(f"   Initialising new head params (dummy forward pass)...")
+        print(f"   Initialising new head params (dummy forward pass, no JIT)...")
         dummy_seq = jnp.zeros((1, window_size, 4), dtype=jnp.float32)
         dummy_org = jnp.zeros((1,), dtype=jnp.int32)
-        new_params, _new_state = jax.jit(_forward_new.init)(
+        new_params, _new_state = _forward_new.init(
             jax.random.PRNGKey(0), dummy_seq, dummy_org
         )
 
@@ -520,9 +590,12 @@ def train(
     best_loss = float('inf')
 
     # Wrap training loop in mesh context (CRITICAL for multi-GPU).
-    # bare P() PartitionSpecs in device_put and jax.jit shardings require
-    # an active jax.set_mesh() context. Model __init__ already handles
-    # its own context; here we cover device_put of batches + jit calls.
+    # jax.set_mesh() provides the axis context for bare P()/P('data') specs
+    # used in jax.device_put (batch sharding) and jax.jit in_shardings/out_shardings
+    # (param replication). Matches the official DeepMind colab pattern exactly:
+    #   with jax.set_mesh(mesh):
+    #       batch = jax.device_put(batch, data_sharding)
+    #       params, state, opt_state, scalars = train_step(params, state, opt_state, batch)
     with mesh_ctx:
         for epoch in range(epochs):
             epoch_losses = []
@@ -531,10 +604,12 @@ def train(
             print(f"\nEpoch {epoch + 1}/{epochs}  [strategy={strategy}]")
             print("-" * 60)
 
-            # Create numpy iterator from TensorFlow dataset
+            # Create numpy iterator from TensorFlow dataset.
+            # NOTE: get_generator() is infinite (while True loop + reshuffle),
+            # so we MUST cap iteration at steps_per_epoch via islice.
             ds_iter = tf_dataset.as_numpy_iterator()
             
-            for batch_idx, batch in enumerate(ds_iter):
+            for batch_idx, batch in enumerate(itertools.islice(ds_iter, steps_per_epoch)):
                 # Progress indicator for first batch (JAX compilation happens here)
                 if batch_idx == 0:
                     print(f"  Compiling JAX functions (this may take 2-5 minutes on first batch)...")
@@ -553,8 +628,8 @@ def train(
                         'signal': jax.device_put(targets['signal'], data_sharding)
                     }
                 
-                # Training step (automatically parallelized based on input sharding)
-                loss_value, predictions, grad_norm = model.train_step(
+                # Training step
+                loss_value, grad_norm = model.train_step(
                     sequences, organism_ids, targets, loss_fn
                 )
                 
@@ -583,7 +658,6 @@ def train(
                         except Exception as e:
                             print(f"  (Visualization skipped: {e})")
                         print(f"  Loss value: {loss_value}")
-                        print(f"  Gradient norm: {grad_norm}")
                         print()
                     
                     print(f"  Training on {steps_per_epoch} batches...")
@@ -593,7 +667,17 @@ def train(
                 if (batch_idx + 1) % print_interval == 0:
                     avg_loss = sum(epoch_losses[-print_interval:]) / min(print_interval, len(epoch_losses))
                     avg_gn   = sum(grad_norms[-print_interval:]) / max(1, min(print_interval, len(grad_norms)))
-                    print(f"  Batch {batch_idx + 1}/{steps_per_epoch}: Loss = {avg_loss:.6f}, Grad Norm = {avg_gn:.6f}")
+                    print(f"  Batch {batch_idx + 1}/{steps_per_epoch}: Loss = {avg_loss:.6f}")
+
+                # Periodic mid-epoch checkpoint (guards against long epochs with no save)
+                if checkpoint_interval > 0 and (batch_idx + 1) % checkpoint_interval == 0:
+                    global_step = epoch * steps_per_epoch + batch_idx + 1
+                    step_dir = os.path.join(output_dir, f'step_{global_step:06d}')
+                    if strategy == 'lora':
+                        model.save_lora(step_dir)
+                    else:
+                        model.save(step_dir)
+                    print(f"  [ckpt] Step {global_step}: saved → {step_dir}")
             
             # Epoch summary
             if len(epoch_losses) > 0:
@@ -649,8 +733,10 @@ def train(
     with open(os.path.join(output_dir, 'training_config.json'), 'w') as f:
         json.dump(config, f, indent=2)
 
-    # ---- restore stdout / close log files --------------------------------
+    # ---- restore stdout / stderr / close log files ----------------------
     _metrics_file.close()
+    os.dup2(_saved_stderr_fd, 2)
+    os.close(_saved_stderr_fd)
     _sys.stdout = _tee._stream
     _tee.close()
     # ----------------------------------------------------------------------
@@ -707,6 +793,8 @@ def main():
                        help='Disable data augmentation (NOTE: TensorFlow pipeline does not support augmentation yet)')
     parser.add_argument('--max-shift', type=int, default=1024)
     parser.add_argument('--num-workers', type=int, default=None)
+    parser.add_argument('--checkpoint-interval', type=int, default=None,
+                       help='Save a checkpoint every N steps within an epoch (default: 500). Set 0 to disable.')
 
     args = parser.parse_args()
 
@@ -750,7 +838,8 @@ def main():
         augment = False
     else:
         augment = config.get('augment', True)
-    
+    checkpoint_interval = get_value(args.checkpoint_interval, 'checkpoint_interval', 500)
+
     # Validate required arguments
     if not checkpoint:
         raise ValueError("--checkpoint is required (or specify 'checkpoint' in config file)")
@@ -779,6 +868,7 @@ def main():
         precision_policy=precision_policy,
         config_path=args.config,
         chrom_sizes_path=chrom_sizes,
+        checkpoint_interval=checkpoint_interval,
     )
 
 

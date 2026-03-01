@@ -7,7 +7,12 @@ Adapted from: https://colab.research.google.com/github/google-deepmind/alphageno
 
 import argparse
 import csv
+import os
 import sys
+
+# ── Suppress noisy C++ (glog) rendezvous warnings ─────────────────────────
+os.environ.setdefault('GLOG_minloglevel', '3')
+# ────────────────────────────────────────────────────────────────────────────
 
 # 1. Environment Setup
 import tensorflow as tf
@@ -52,10 +57,10 @@ import pandas as pd
 # - `NUM_TRAIN_STEPS`: Number of training steps for which we optimize the model.
 # - `SEQUENCE_LENGTH`: Length of input DNA sequences (1M bp = 2^20). Training requires at least 2**17.
 # - `BATCH_SIZE`: Number of samples per device.
-# - `ORGANISM`: Target organism for predictions. Hardcoded to mouse for CUT&Tag data.
+# - `ORGANISM`: Target organism for predictions. Set to HOMO_SAPIENS for the official baseline run.
 
 # Parse command-line arguments
-parser = argparse.ArgumentParser(description='Fine-tune AlphaGenome on CUT&Tag data')
+parser = argparse.ArgumentParser(description='Fine-tune AlphaGenome baseline run (HOMO_SAPIENS + ENCODE tracks)')
 parser.add_argument('--learning-rate', type=float, default=5e-4, help='Learning rate')
 parser.add_argument('--num-steps', type=int, default=1000, help='Number of training steps')
 parser.add_argument('--batch-size', type=int, default=1, help='Batch size per device')
@@ -64,8 +69,8 @@ parser.add_argument('--checkpoint-dir', type=str, default='checkpoints/fine_tune
 parser.add_argument('--pretrained-checkpoint', type=str, 
                     default='/home/ray/AG_Finetune/checkpoints/pre_trained/alphagenome-all-folds',
                     help='Path to pretrained checkpoint')
-parser.add_argument('--fasta', type=str, default='/home/ray/AG_Finetune/data/resources/mm10.fa',
-                    help='Path to genome FASTA file')
+parser.add_argument('--fasta', type=str, default='/home/ray/AG_Finetune/data/resources/hg38.fa',
+                    help='Path to hg38 genome FASTA. If omitted, uses remote GCS URL from AlphaGenome.')
 parser.add_argument('--windows-bed', type=str,
                     default='/home/ray/AG_Finetune/exports/peak_safe_windows/D1MSN_H3K27ac_merged_peak_safe_windows.bed',
                     help='Path to BED file with training windows (safe windows recommended)')
@@ -77,8 +82,8 @@ NUM_TRAIN_STEPS = args.num_steps
 MODEL_VERSION = dna_model.ModelVersion.FOLD_0
 SEQUENCE_LENGTH = args.sequence_length
 BATCH_SIZE = args.batch_size
-ORGANISM = dna_model.Organism.MUS_MUSCULUS
-SAVE_CHECKPOINT_DIR = args.checkpoint_dir
+ORGANISM = dna_model.Organism.HOMO_SAPIENS
+SAVE_CHECKPOINT_DIR = os.path.abspath(args.checkpoint_dir)
 PRETRAINED_CHECKPOINT = args.pretrained_checkpoint
 FASTA_PATH = args.fasta
 WINDOWS_BED = args.windows_bed
@@ -90,43 +95,28 @@ WINDOWS_BED = args.windows_bed
 # - `strand`: Strand orientation (`+`, `-`, or `.` for unstranded)
 # - `nonzero_mean`: Optional mean of non-zero values (used for normalization).
 # - `file_path`: Path to the BigWig file containing the track data.
+# Human ENCODE tracks (RNA-seq +/- strands + DNase-seq)
+# BigWig files from: https://storage.googleapis.com/alphagenome/reference/encode/hg38/
+# These are the same tracks used in the official DeepMind finetuning notebook.
 TRACK_METADATA = pd.DataFrame(
     data=[
         [
-            'ATAC',
-            'D1MSN H3K27ac CUT&Tag',
+            'RNA_SEQ',
+            'UBERON:0000948 total RNA-seq',
             '+',
-            '/home/ray/AG_Finetune/data/CUTTag/processed_bigwig/D1MSN_H3K27ac_averaged_normalized.bigwig',
+            '/home/ray/AG_Finetune/data/encode_hg38/ENCFF018EZY.bigWig',
         ],
         [
-            'ATAC',
-            'D1MSN H3K4me1 CUT&Tag',
-            '+',
-            '/home/ray/AG_Finetune/data/CUTTag/processed_bigwig/D1MSN_H3K4me1_averaged_normalized.bigwig',
+            'RNA_SEQ',
+            'UBERON:0000948 total RNA-seq',
+            '-',
+            '/home/ray/AG_Finetune/data/encode_hg38/ENCFF904TSK.bigWig',
         ],
         [
-            'ATAC',
-            'D1MSN H3K27me3 CUT&Tag',
-            '+',
-            '/home/ray/AG_Finetune/data/CUTTag/processed_bigwig/D1MSN_H3K27me3_averaged_normalized.bigwig',
-        ],
-        [
-            'ATAC',
-            'D2MSN H3K27ac CUT&Tag',
-            '+',
-            '/home/ray/AG_Finetune/data/CUTTag/processed_bigwig/D2MSN_H3K27ac_averaged_normalized.bigwig',
-        ],
-        [
-            'ATAC',
-            'D2MSN H3K4me1 CUT&Tag',
-            '+',
-            '/home/ray/AG_Finetune/data/CUTTag/processed_bigwig/D2MSN_H3K4me1_averaged_normalized.bigwig',
-        ],
-        [
-            'ATAC',
-            'D2MSN H3K27me3 CUT&Tag',
-            '+',
-            '/home/ray/AG_Finetune/data/CUTTag/processed_bigwig/D2MSN_H3K27me3_averaged_normalized.bigwig',
+            'DNASE',
+            'EFO:0005337 DNase-seq',
+            '.',
+            '/home/ray/AG_Finetune/data/encode_hg38/ENCFF218CLQ.bigWig',
         ],
     ],
     columns=['output_type', 'name', 'strand', 'file_path'],
@@ -165,7 +155,7 @@ def build_output_metadata(
 
 
 output_metadata = {
-    dna_model.Organism.MUS_MUSCULUS: build_output_metadata(TRACK_METADATA)
+    dna_model.Organism.HOMO_SAPIENS: build_output_metadata(TRACK_METADATA)
 }
 
 # 5. Data Pipeline
@@ -187,7 +177,7 @@ print(f"\n⚠️  WARNING: Using AlphaGenome's default fold intervals.")
 print(f"    Custom BED file ({WINDOWS_BED}) is specified but not yet integrated.")
 print(f"    TODO: Implement custom interval loading to use safe windows.\n")
 
-ds_iter = finetune.get_dataset_iterator(
+ds_iter_kwargs = dict(
     batch_size=BATCH_SIZE * jax.local_device_count(),
     sequence_length=SEQUENCE_LENGTH,
     output_metadata=output_metadata[ORGANISM],
@@ -195,6 +185,9 @@ ds_iter = finetune.get_dataset_iterator(
     model_version=MODEL_VERSION,
     subset=fold_intervals.Subset.TRAIN,
 )
+if args.fasta is not None:
+    ds_iter_kwargs['fasta_path'] = args.fasta
+ds_iter = finetune.get_dataset_iterator(**ds_iter_kwargs)
 
 batch = next(ds_iter)
 pprint.pprint(jax.tree.map(np.shape, batch))

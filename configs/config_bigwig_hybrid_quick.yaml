@@ -1,0 +1,52 @@
+# AlphaGenome Fine-tuning Configuration — Hybrid Head+LoRA, Quick 3-epoch run
+#
+# Identical to config_bigwig_hybrid.yaml except:
+#   epochs: 3  (1 freeze + 2 LoRA)
+#   Expected wall time: ~45 min
+#
+# Checkpoints are saved with jax.device_get() → plain numpy, no NamedSharding.
+# Load with CUDA_VISIBLE_DEVICES=0 in the evaluation notebook (no LD_PRELOAD
+# needed, no NCCL, single-GPU inference).
+#
+# Usage:
+#   LD_PRELOAD=/home/ray/miniforge3/envs/alphagenome/lib/python3.11/site-packages/nvidia/nccl/lib/libnccl.so.2 \
+#       python scripts/tf_ft_hybrid.py --config configs/config_bigwig_hybrid_quick.yaml
+
+
+# PATHS (Required)
+checkpoint: /home/ray/AG_Finetune/checkpoints/pre_trained/alphagenome-all-folds
+fasta: /home/ray/AG_Finetune/data/resources/mm10.fa
+signal: /home/ray/AG_Finetune/data/CUTTag/ZHY-250227-1/ZHY-250227-1_ACTGCATATAAGGCGA/alignment/bigwig/ZHY-250227-1_ACTGCATATAAGGCGA_bowtie2.chrombpnet_reads_to_bw_unstranded.bw
+output: /home/ray/AG_Finetune/checkpoints/fine_tuned
+
+## Required when windows_bed is omitted (whole-genome mode)
+chrom_sizes: /home/ray/AG_Finetune/data/resources/mm10.chrom.sizes
+
+
+# PRECISION
+precision_policy: params=float32,compute=float32,output=float32
+
+
+# TRAINING HYPERPARAMETERS
+epochs: 3
+freeze_epochs: 1        # Phase 1: 1 epoch head-only (~6.5 min)
+                        # Phase 2: 2 epochs head+LoRA (~38 min)
+batch_size: 8
+learning_rate: 5e-4
+checkpoint_interval: 20
+
+
+# LORA CONFIGURATION (Phase 2)
+lora_rank: 8
+lora_alpha: 16.0
+
+
+# DATA & AUGMENTATION
+window_size: 131072     # 2^17 bp
+organism_id: 1          # mouse
+augment: true
+max_shift: 1024
+
+
+# SYSTEM
+num_workers: 0
