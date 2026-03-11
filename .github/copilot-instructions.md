@@ -64,12 +64,12 @@ When collecting scalar outputs from jitted+sharded functions, always use `jax.de
 
 - Signal: BigWig (primary) or BedGraph, base-pair resolution, normalized to **100M total insertions per track**. The TensorFlow pipeline reads BigWig directly via `pyBigWig`.
 - Raw counts are passed as `float32` targets; the loss function transforms them internally — **do not pre-transform targets**.
-- **⚠️ Target transform gap (known issue):** AlphaGenome's paper specifies `targets_scaling` which divides targets by the per-track genome-wide mean of non-zero values (`track_means`) before applying smooth clipping. Our `baskerville_target_transform` in `utils/borzoi_loss.py` applies a different Baskerville/hound-codebase transform (scale × sqrt + soft clip) **without** the `track_means` normalization step. This means the loss operates in a different magnitude space than AlphaGenome's pre-training, which may affect peak-region fitting. The correct AlphaGenome transform is:
+- **AlphaGenome target transform:** `utils/borzoi_loss.py` implements `alphagenome_targets_scaling` matching the paper exactly:
   ```
-  targets = targets / track_means          # normalize to unit mean
+  targets = targets / track_mean           # normalize by genome-wide non-zero mean
   targets = where(targets > 10, 2*sqrt(targets*10) - 10, targets)  # smooth clip
   ```
-  `track_means` must be pre-computed as the mean of non-zero values of the BigWig signal across the entire training genome. **TODO:** implement proper `targets_scaling` matching the paper.
+  `track_mean` is computed at training startup by `compute_track_mean_from_bigwig()` (genome-wide weighted mean of non-zero BigWig values) and frozen into `loss_fn` via `functools.partial`. The inverse `alphagenome_predictions_scaling(preds, track_mean)` converts model outputs back to count space for evaluation. Both are in `utils/borzoi_loss.py`. The training script uses `cut_and_tag_loss_alphagenome`; the old `cut_and_tag_loss_baskerville` (Baskerville sqrt transform, no `track_mean`) is kept for backward compatibility only.
 - `organism_id`: `0` = human, `1` = mouse.
 - `window_size` must be divisible by 128. AlphaGenome was pretrained on 1,048,576 bp (2^20^); fine-tuning uses 131,072 bp (2^17^).
 - CUT&Tag is conceptually identical to ATAC-seq: use the `atac` prediction head at 1 bp resolution.
@@ -114,10 +114,12 @@ LD_PRELOAD=/home/ray/miniforge3/envs/alphagenome/lib/python3.11/site-packages/nv
 |---|---|---|---|---|
 | `fine_tuned_hybrid_freeze1_2026-02-28_14-00-57` | Hybrid | 1 frozen + 2 LoRA | 0.0372 | Quick test run |
 | `fine_tuned_hybrid_freeze2_2026-02-28_16-26-59` | Hybrid | 2 frozen + 8 LoRA | 0.000138 | Full run |
+| `fine_tuned_hybrid_freeze1_2026-03-01_13-35-58` | Hybrid | 1 frozen + 2 LoRA | 0.000288 | First run with corrected AlphaGenome `targets_scaling`; track_mean=1.171128 |
+| `fine_tuned_hybrid_freeze2_2026-03-01_14-50-31` | Hybrid | 2 frozen + 8 LoRA | 0.064421 | Full 10-epoch run; track_mean=1.171128 |
 
 All runs are under `checkpoints/` (symlink → `/celestial/ray/model_checkpoints/AlphaGenome`). Each run contains `metrics.csv`, `train.log`, `stderr.log`, `training_config.json`, per-epoch `epoch_NNN/` checkpoints, and `best_checkpoint/`.
 
-**Evaluation notebooks:** `notebooks/evaluate_freeze1_2026-02-28.ipynb` and `notebooks/evaluate_freeze2_2026-02-28.ipynb` — cover training curves (sections 1–5), model loading (section 6), and results display (section 8). Inference is delegated to `scripts/evaluate.py` launched as a subprocess (section 7).
+**Evaluation notebooks:** `notebooks/evaluate_freeze1_2026-02-28.ipynb`, `notebooks/evaluate_freeze2_2026-02-28.ipynb`, `notebooks/evaluate_freeze1_2026-03-01.ipynb`, and `notebooks/evaluate_freeze2_2026-03-01.ipynb` — cover training curves (sections 1–5), model loading (section 6), and results display (section 8). Inference is delegated to `scripts/evaluate.py` launched as a subprocess (section 7).
 
 ---
 

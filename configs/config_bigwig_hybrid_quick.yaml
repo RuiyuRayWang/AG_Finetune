@@ -33,7 +33,7 @@ freeze_epochs: 1        # Phase 1: 1 epoch head-only (~6.5 min)
                         # Phase 2: 2 epochs head+LoRA (~38 min)
 batch_size: 8
 learning_rate: 5e-4
-checkpoint_interval: 20
+checkpoint_interval: 0
 
 
 # LORA CONFIGURATION (Phase 2)

@@ -363,3 +363,227 @@ def cut_and_tag_loss(predictions, targets, track_mean=None):
         total_weight=1.0,
         epsilon=1e-7,
     )
+
+
+# ---------------------------------------------------------------------------
+# AlphaGenome paper-correct target transform
+# ---------------------------------------------------------------------------
+
+def compute_track_mean_from_bigwig(
+    bigwig_path: str,
+    chrom_sizes_path: str = None,
+) -> float:
+    """
+    Compute the mean of non-zero base-level values genome-wide from a BigWig.
+
+    This is the ``track_means`` value required by AlphaGenome's
+    ``targets_scaling``.  Must be called once at training startup; the result
+    is stored as a scalar and passed to ``cut_and_tag_loss_alphagenome`` via
+    ``functools.partial``.
+
+    Args:
+        bigwig_path: Path to the (100M-normalised, 1bp-resolution) BigWig.
+        chrom_sizes_path: Optional chrom.sizes file; if given, only chromosomes
+            listed there are scanned.  Otherwise canonical chr* chromosomes
+            (no underscores, no 'random'/'Un' suffixes) are used.
+
+    Returns:
+        Mean of non-zero values weighted by interval length (float).
+        Returns 1.0 if no non-zero values are found.
+    """
+    import pyBigWig
+
+    bw = pyBigWig.open(bigwig_path)
+    all_chroms = bw.chroms()
+
+    if chrom_sizes_path is not None:
+        with open(chrom_sizes_path) as f:
+            canonical = {line.split()[0] for line in f if line.strip()}
+        chroms = {k: v for k, v in all_chroms.items() if k in canonical}
+    else:
+        # Use canonical chromosomes only (skip random / unplaced contigs)
+        chroms = {
+            k: v for k, v in all_chroms.items()
+            if k.startswith('chr') and '_' not in k
+            and 'random' not in k.lower() and 'un' not in k.lower()
+        }
+
+    total_sum   = 0.0
+    total_count = 0
+
+    for chrom, chrom_len in sorted(chroms.items()):
+        try:
+            intervals = bw.intervals(chrom, 0, chrom_len)
+            if intervals is None:
+                continue
+            for start, end, value in intervals:
+                if np.isfinite(value) and value > 0.0:
+                    length = end - start
+                    total_sum   += float(value) * length
+                    total_count += length
+        except Exception:
+            continue
+
+    bw.close()
+
+    if total_count == 0:
+        return 1.0
+    return float(total_sum / total_count)
+
+
+def alphagenome_targets_scaling(
+    targets: jnp.ndarray,
+    track_mean: float,
+    apply_squashing: bool = False,
+) -> jnp.ndarray:
+    """
+    AlphaGenome paper ``targets_scaling`` (exact match to paper pseudocode).
+
+    Steps:
+        1. targets = targets / track_mean
+        2. (RNA-seq only) targets = targets ** 0.75
+        3. smooth clip: where(targets > 10, 2*sqrt(targets*10) - 10, targets)
+
+    Args:
+        targets: Raw signal counts [batch, seq_len] or [batch, seq_len, tracks].
+        track_mean: Pre-computed mean of non-zero values genome-wide
+            (from ``compute_track_mean_from_bigwig``).
+        apply_squashing: Power transform (True for RNA-seq, False for ATAC).
+
+    Returns:
+        Scaled targets in AlphaGenome's training space.
+    """
+    targets = targets.astype(jnp.float32)
+    targets = jnp.where(jnp.isfinite(targets), targets, 0.0)
+    targets = jnp.maximum(targets, 0.0)
+
+    # 1. Normalise by genome-wide non-zero mean
+    targets = targets / float(track_mean)
+
+    # 2. Optional power squashing (RNA-seq only)
+    if apply_squashing:
+        targets = targets ** 0.75
+
+    # 3. Square-root-based smooth clip for high values
+    targets = jnp.where(
+        targets > 10.0,
+        2.0 * jnp.sqrt(targets * 10.0) - 10.0,
+        targets,
+    )
+
+    targets = jnp.where(jnp.isfinite(targets), targets, 0.0)
+    return targets
+
+
+def alphagenome_predictions_scaling(
+    predictions: jnp.ndarray,
+    track_mean: float,
+    apply_squashing: bool = False,
+) -> jnp.ndarray:
+    """
+    Inverse of ``alphagenome_targets_scaling``.
+
+    Apply to raw model outputs (``preds.atac.values[:, 0]``) to convert them
+    back to the original count space for comparison with BigWig signal.
+
+    Args:
+        predictions: Model predictions in transformed space.
+        track_mean: Same value used during training.
+        apply_squashing: Must match the value used in ``targets_scaling``.
+
+    Returns:
+        Predictions in original count units.
+    """
+    predictions = predictions.astype(jnp.float32)
+
+    # Inverse smooth clip
+    predictions = jnp.where(
+        predictions > 10.0,
+        (predictions + 10.0) ** 2 / 40.0,
+        predictions,
+    )
+
+    # Inverse power squashing (RNA-seq only)
+    if apply_squashing:
+        predictions = predictions ** (1.0 / 0.75)
+
+    # Inverse mean normalisation
+    predictions = predictions * float(track_mean)
+
+    predictions = jnp.where(jnp.isfinite(predictions), predictions, 0.0)
+    predictions = jnp.maximum(predictions, 0.0)
+    return predictions
+
+
+def cut_and_tag_loss_alphagenome(
+    predictions,
+    targets: jnp.ndarray,
+    track_mean: float,
+    total_weight: float = 1.0,
+    epsilon: float = 1e-6,
+) -> float:
+    """
+    CUT&Tag loss using AlphaGenome's exact ``targets_scaling`` from the paper.
+
+    Replaces ``cut_and_tag_loss_baskerville``.  The only difference is that
+    targets are normalised by ``track_mean`` (genome-wide non-zero mean) then
+    smooth-clipped at 10, matching AlphaGenome's pre-training procedure.
+
+    ``track_mean`` is a static float frozen into the callable via
+    ``functools.partial`` before JIT compilation::
+
+        loss_fn = functools.partial(
+            cut_and_tag_loss_alphagenome, track_mean=track_mean
+        )
+
+    Args:
+        predictions: Model output array [batch, seq_len] or [batch, seq_len, 1].
+        targets: Raw CUT&Tag counts [batch, seq_len].
+        track_mean: Genome-wide mean of non-zero values (from
+            ``compute_track_mean_from_bigwig``).
+        total_weight: Weight for Poisson term (default 1.0).
+        epsilon: Numerical stability floor.
+
+    Returns:
+        Scalar loss.
+    """
+    # Extract ATAC signal if predictions is the raw Haiku model output dict
+    # (inside JIT training step, model returns a nested dict; outside (eval), it may
+    # already be a plain array)
+    if isinstance(predictions, dict):
+        atac_preds = predictions.get('atac', {})
+        if 'scaled_predictions_1bp' in atac_preds:
+            pred_signal = atac_preds['scaled_predictions_1bp']  # [batch, seq_len, tracks]
+            if pred_signal.ndim == 3:
+                pred_signal = pred_signal[..., 0]  # take single CUT&Tag track
+        else:
+            raise ValueError(
+                f"Cannot find 'scaled_predictions_1bp' in predictions['atac']. "
+                f"Top-level keys: {list(predictions.keys())}"
+            )
+    else:
+        pred_signal = predictions
+        if pred_signal.ndim == 3 and pred_signal.shape[-1] == 1:
+            pred_signal = pred_signal[..., 0]
+
+    pred_signal = pred_signal.astype(jnp.float32)
+    pred_signal = jnp.where(jnp.isfinite(pred_signal), pred_signal, epsilon)
+    pred_signal = jnp.maximum(pred_signal, epsilon)
+    pred_signal = jnp.minimum(pred_signal, 1000.0)
+
+    targets_transformed = alphagenome_targets_scaling(
+        targets, track_mean=track_mean, apply_squashing=False
+    )
+
+    loss_per_batch = poisson_multinomial_loss(
+        y_true=targets_transformed,
+        y_pred=pred_signal,
+        total_weight=total_weight,
+        weight_range=1.0,
+        epsilon=epsilon,
+    )
+
+    loss = jnp.mean(loss_per_batch)
+    loss = jnp.where(jnp.isfinite(loss), loss, 1e6)
+    loss = jnp.maximum(loss, epsilon)
+    return loss

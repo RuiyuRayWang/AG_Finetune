@@ -25,7 +25,6 @@ signal: /home/ray/AG_Finetune/data/CUTTag/ZHY-250227-1/ZHY-250227-1_ACTGCATATAAG
 output: /home/ray/AG_Finetune/checkpoints/fine_tuned
 
 ## Optional: BED file with specific genomic windows to use for training
-## STRONGLY RECOMMENDED: Use safe windows to avoid hypersensitive artifact regions
 ## If not provided, non-overlapping windows are generated from chrom_sizes (whole-genome mode)
 windows_bed:
 # windows_bed: /home/ray/AG_Finetune/exports/peak_safe_windows/D1MSN_H3K27ac_merged_peak_safe_windows.bed  # Disabled
@@ -43,7 +42,7 @@ epochs: 10
 freeze_epochs: 2        # Phase 1 length: epochs to keep trunk fully frozen
 batch_size: 8
 learning_rate: 5e-4     # Peak LR used in both phases
-checkpoint_interval: 20   # Mid-epoch checkpoint every N steps. Set 0 to disable.
+checkpoint_interval: 0    # Mid-epoch crash-recovery saves. Disabled: no resume logic exists, so these are never used.
 
 
 # LORA CONFIGURATION (Phase 2)

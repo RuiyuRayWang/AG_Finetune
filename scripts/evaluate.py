@@ -37,8 +37,15 @@ import matplotlib.patches as mpatches
 from scipy import stats
 import pyBigWig
 
+sys.path.insert(0, "/home/ray/AG_Finetune")
+from utils.borzoi_loss import (
+    alphagenome_predictions_scaling,
+    compute_track_mean_from_bigwig,
+)
+
 # ── JAX (imported after CUDA_VISIBLE_DEVICES) ──────────────────────────────
 import jax
+import jax.numpy as jnp
 jax.config.update("jax_compilation_cache_dir",
                   "/home/ray/AG_Finetune/.jax_cache")
 jax.config.update("jax_persistent_cache_min_compile_time_secs", 5)
@@ -185,9 +192,17 @@ def run_predictions(
     eval_windows: list[tuple[str, int, int]],
     signal_path: str,
     window_size: int,
+    track_mean: float = 1.0,
 ) -> list[dict]:
-    """Predict + fetch ground-truth for every eval window."""
+    """Predict + fetch ground-truth for every eval window.
+
+    ``track_mean`` (from training_config.json) is used to apply the inverse
+    AlphaGenome targets_scaling transform so predictions are in the same
+    count space as the BigWig signal.
+    """
     _banner(f"Running predictions on {len(eval_windows)} windows")
+    print(f"  track_mean = {track_mean:.6f}  (inverse-scaling to count space)",
+          flush=True)
     results = []
     bw = pyBigWig.open(signal_path)
 
@@ -205,7 +220,15 @@ def run_predictions(
 
         # TrackData.values shape: [window_size, num_tracks]
         raw      = preds.atac.values
-        pred_arr = np.array(raw[:, 0], dtype=np.float32)
+        # Model outputs are in the transformed space (after targets_scaling);
+        # apply the inverse to get back to original count units.
+        pred_scaled = np.array(raw[:, 0], dtype=np.float32)
+        pred_arr = np.array(
+            alphagenome_predictions_scaling(
+                jnp.array(pred_scaled), track_mean=track_mean
+            ),
+            dtype=np.float32,
+        )
 
         obs_raw  = bw.values(chrom, start, end, numpy=True)
         obs_arr  = np.nan_to_num(obs_raw, nan=0.0).astype(np.float32)
@@ -505,12 +528,26 @@ def main():
 
     # ── Load training config ───────────────────────────────────────────────
     cfg_path = os.path.join(run_dir, "training_config.json")
+    cfg = {}
     if os.path.exists(cfg_path):
         with open(cfg_path) as f:
             cfg = json.load(f)
         print(f"\n  Training config:")
         for k, v in cfg.items():
             print(f"    {k:<22}: {v}")
+
+    # Resolve track_mean: prefer training_config.json, fall back to computing
+    # it directly from the BigWig (older runs pre-date this field).
+    if "track_mean" in cfg:
+        track_mean = float(cfg["track_mean"])
+        print(f"\n  track_mean (from config): {track_mean:.6f}", flush=True)
+    else:
+        print("\n  track_mean not found in config — computing from BigWig...",
+              flush=True)
+        track_mean = compute_track_mean_from_bigwig(
+            args.signal, chrom_sizes_path=args.chrom_sizes
+        )
+        print(f"  track_mean (computed)   : {track_mean:.6f}", flush=True)
 
     # ── Load model ─────────────────────────────────────────────────────────
     model, organism = load_model(ckpt_dir, args.signal, args.fasta)
@@ -536,7 +573,8 @@ def main():
 
     # ── Predictions ────────────────────────────────────────────────────────
     results = run_predictions(model, organism, eval_windows,
-                              args.signal, args.window_size)
+                              args.signal, args.window_size,
+                              track_mean=track_mean)
 
     # ── Metrics ────────────────────────────────────────────────────────────
     _banner("Computing metrics")

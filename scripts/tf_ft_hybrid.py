@@ -69,7 +69,10 @@ from alphagenome_research.model.metadata import metadata as metadata_lib
 from alphagenome_research.io import fasta as fasta_lib
 from alphagenome_research.model import one_hot_encoder
 
-from utils.borzoi_loss import cut_and_tag_loss_baskerville
+from utils.borzoi_loss import (
+    cut_and_tag_loss_alphagenome,
+    compute_track_mean_from_bigwig,
+)
 from utils.lora_utils import (
     initialize_lora_params,
     apply_lora_to_params,
@@ -836,6 +839,12 @@ def train(
     num_windows     = len(pipeline.intervals)
     steps_per_epoch = num_windows // batch_size
 
+    print(f"   Computing track_mean from BigWig (for AlphaGenome targets_scaling)...")
+    track_mean = compute_track_mean_from_bigwig(
+        signal_path, chrom_sizes_path=chrom_sizes_path
+    )
+    print(f"   track_mean = {track_mean:.6f}  (genome-wide mean of non-zero bp values)")
+
     # LR schedules
     freeze_phase_steps  = steps_per_epoch * max(1, freeze_epochs)
     freeze_warmup_steps = int(0.05 * freeze_phase_steps)
@@ -924,7 +933,10 @@ def train(
     # ── Training loop ───────────────────────────────────────────────────────
     print(f"\n4. Starting training for {epochs} epochs  "
           f"[freeze_epochs={freeze_epochs}, lora_epochs={lora_phase_epochs}]...")
-    loss_fn   = cut_and_tag_loss_baskerville
+    # Bind track_mean into a plain closure — functools.partial is not hashable
+    # and cannot be used with jax.jit static_argnames.
+    def loss_fn(predictions, targets):
+        return cut_and_tag_loss_alphagenome(predictions, targets, track_mean=track_mean)
     best_loss = float('inf')
 
     with mesh_ctx:
@@ -995,15 +1007,16 @@ def train(
                     )
                     print(f"  Batch {batch_idx + 1}/{steps_per_epoch}: Loss = {avg:.6f}")
 
-                # Mid-epoch periodic checkpoint — also updates best_checkpoint
-                # if this step's loss is lower than anything seen so far.
+                # Mid-epoch periodic checkpoint — crash-recovery only.
+                # Does NOT update best_loss; best checkpoint is determined
+                # solely by the full-epoch mean at epoch end.
                 if checkpoint_interval > 0 and (batch_idx + 1) % checkpoint_interval == 0:
                     global_step = epoch * steps_per_epoch + batch_idx + 1
-                    if avg < best_loss:
-                        best_loss = avg
-                        best_dir = os.path.join(output_dir, 'best_checkpoint')
-                        model.save(best_dir)
-                        print(f"  [ckpt] step={global_step} loss={avg:.4f} → NEW BEST")
+                    periodic_dir = os.path.join(
+                        output_dir, f'epoch_{epoch + 1:03d}_step_{global_step:06d}')
+                    model.save(periodic_dir)
+                    print(f"  [ckpt] periodic save at step={global_step} "
+                          f"(rolling loss={avg:.4f})")
 
             # ── Epoch summary ─────────────────────────────────────────────
             if epoch_losses:
@@ -1043,6 +1056,7 @@ def train(
         'window_size':     window_size,
         'best_loss':       best_loss,
         'signal_format':   signal_format,
+        'track_mean':      track_mean,
     }
     with open(os.path.join(output_dir, 'training_config.json'), 'w') as f:
         json.dump(config_out, f, indent=2)
