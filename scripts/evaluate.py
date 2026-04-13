@@ -34,6 +34,8 @@ import matplotlib
 matplotlib.use("Agg")   # non-interactive backend — safe in terminal
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+from io import BytesIO
+import matplotlib.image as mpimg
 from scipy import stats
 import pyBigWig
 
@@ -51,7 +53,9 @@ jax.config.update("jax_compilation_cache_dir",
 jax.config.update("jax_persistent_cache_min_compile_time_secs", 5)
 
 from alphagenome.data import genome as genome_lib
+from alphagenome.data import track_data as track_data_lib
 from alphagenome.models import dna_output
+from alphagenome.visualization import plot_components
 from alphagenome_research.model import dna_model
 from alphagenome_research.model.metadata import metadata as metadata_lib
 
@@ -297,6 +301,98 @@ def compute_metrics(results: list[dict], window_size: int, bin_size: int = 128):
 PHASE_COLORS  = {"frozen": "#4273c8", "lora": "#e07b39"}
 CHROM_COLORS  = {"chr17": "#4273c8", "chr18": "#e07b39", "chr19": "#4caf50"}
 
+# Colors for the paper-style separate-track visualisation
+PRED_COLOR = "black"    # predicted signal — matches AlphaGenome colab convention
+OBS_COLOR  = "#d63031"  # observed signal  — matches AlphaGenome colab convention
+
+
+def _build_track_fig(
+    r: dict,
+    window_size: int,
+    bin_size: int,
+    fig_width: int = 14,
+) -> matplotlib.figure.Figure:
+    """Return a plot_components figure with pred (top) and obs (bottom) as
+    separate filled tracks for one genomic window.
+
+    Uses ``alphagenome.visualization.plot_components`` — the same API used in
+    the AlphaGenome paper figures — so the layout and styling match the paper.
+    """
+    nb = window_size // bin_size
+    pred_b = r["pred"].reshape(nb, bin_size).mean(axis=1).astype(np.float32)
+    obs_b  = r["obs"].reshape(nb, bin_size).mean(axis=1).astype(np.float32)
+
+    chrom, start, end = r["chrom"], r["start"], r["end"]
+    interval = genome_lib.Interval(chrom, start, end)
+
+    # Build TrackData objects; metadata needs at least 'name' and 'strand'.
+    pred_tdata = track_data_lib.TrackData(
+        values=pred_b.reshape(-1, 1),
+        metadata=pd.DataFrame([{"name": "Predicted", "strand": "."}]),
+        resolution=bin_size,
+        interval=interval,
+    )
+    obs_tdata = track_data_lib.TrackData(
+        values=obs_b.reshape(-1, 1),
+        metadata=pd.DataFrame([{"name": "Observed", "strand": "."}]),
+        resolution=bin_size,
+        interval=interval,
+    )
+
+    rv = stats.pearsonr(pred_b, obs_b)[0]
+    rh = stats.spearmanr(pred_b, obs_b)[0]
+    title = (
+        f"{chrom}:{start:,}–{end:,}  |  "
+        f"Pearson r = {rv:.3f}   Spearman ρ = {rh:.3f}"
+    )
+
+    fig = plot_components.plot(
+        [
+            plot_components.Tracks(
+                tdata=pred_tdata,
+                filled=True,
+                track_colors=PRED_COLOR,
+                ylabel_template="{name}",
+            ),
+            plot_components.Tracks(
+                tdata=obs_tdata,
+                filled=True,
+                track_colors=OBS_COLOR,
+                ylabel_template="{name}",
+            ),
+        ],
+        interval=interval,
+        title=title,
+        fig_width=fig_width,
+        fig_height_scale=1.8,
+    )
+    return fig
+
+
+def _stitch_figs_vertically(figs: list, out_path: str, dpi: int = 120) -> None:
+    """Render each matplotlib Figure to a buffer, stitch vertically, save PNG."""
+    imgs = []
+    for fig in figs:
+        buf = BytesIO()
+        fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight")
+        buf.seek(0)
+        imgs.append(mpimg.imread(buf))
+        plt.close(fig)
+
+    # Pad canvases to the same width (fill with white)
+    max_w = max(im.shape[1] for im in imgs)
+    nch   = imgs[0].shape[2]
+    padded = []
+    for im in imgs:
+        if im.shape[1] < max_w:
+            pad = np.ones((im.shape[0], max_w - im.shape[1], nch), dtype=np.float32)
+            im = np.concatenate([im, pad], axis=1)
+        padded.append(im)
+
+    canvas = np.concatenate(padded, axis=0)
+    plt.imsave(out_path, canvas)
+    print(f"  Saved → {out_path}", flush=True)
+
 
 def plot_training_curves(metrics_csv: str, run_dir: str) -> None:
     df = pd.read_csv(metrics_csv, parse_dates=["timestamp"])
@@ -381,70 +477,23 @@ def plot_training_curves(metrics_csv: str, run_dir: str) -> None:
 
 def plot_tracks(results: list[dict], window_size: int,
                 run_dir: str, n: int = 4, bin_size: int = 128) -> None:
-    show = results[:n]
-    fig, axes = plt.subplots(len(show), 1,
-                             figsize=(16, 3.2 * len(show)), sharex=False)
-    if len(show) == 1:
-        axes = [axes]
-    for ax, r in zip(axes, show):
-        nb    = window_size // bin_size
-        pred  = r["pred"].reshape(nb, bin_size).mean(axis=1)
-        obs   = r["obs"].reshape(nb, bin_size).mean(axis=1)
-        bpos  = r["start"] + np.arange(nb) * bin_size + bin_size // 2
-        ax.fill_between(bpos, obs,  alpha=0.55, color="#e07b39", label="Observed")
-        ax.fill_between(bpos, pred, alpha=0.55, color="#4273c8", label="Predicted")
-        rv = stats.pearsonr(pred, obs)[0]
-        rh = stats.spearmanr(pred, obs)[0]
-        ax.set_title(f"{r['chrom']}:{r['start']:,}–{r['end']:,}  |  "
-                     f"Pearson r={rv:.3f}  Spearman ρ={rh:.3f}", fontsize=10)
-        ax.set_ylabel("Signal (128-bp avg)", fontsize=8)
-        ax.legend(fontsize=8, loc="upper right")
-        ax.set_xlabel(f"Position on {r['chrom']} (bp)", fontsize=8)
-        ax.grid(True, alpha=0.3)
-    plt.suptitle("Predicted vs Observed CUT&Tag Signal  [Hybrid AlphaGenome · mm10]",
-                 fontsize=12, y=1.01)
-    plt.tight_layout()
-    out = os.path.join(run_dir, "pred_vs_obs_tracks.png")
-    plt.savefig(out, dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"  Saved → {out}", flush=True)
+    """Paper-style track plot: predicted and observed as separate stacked panels.
+
+    Uses ``plot_components.Tracks`` (filled) — the same component used in
+    AlphaGenome paper figures — so each track gets its own panel.
+    """
+    figs = [_build_track_fig(r, window_size, bin_size) for r in results[:n]]
+    _stitch_figs_vertically(figs, os.path.join(run_dir, "pred_vs_obs_tracks.png"))
 
 
 def plot_peak_tracks(results: list[dict], window_size: int,
                      run_dir: str, n: int = 4, bin_size: int = 128) -> None:
-    top = sorted(results, key=lambda r: r["obs"].max(), reverse=True)[:n]
-    fig, axes = plt.subplots(len(top), 1,
-                             figsize=(16, 3.5 * len(top)), sharex=False)
-    if len(top) == 1:
-        axes = [axes]
-    for ax, r in zip(axes, top):
-        nb    = window_size // bin_size
-        pred  = r["pred"].reshape(nb, bin_size).mean(axis=1)
-        obs   = r["obs"].reshape(nb, bin_size).mean(axis=1)
-        bpos  = r["start"] + np.arange(nb) * bin_size + bin_size // 2
-        summit = bpos[int(np.argmax(obs))]
-        ax.fill_between(bpos, obs,  color="#e07b39", alpha=0.6,
-                        label="Observed", step="mid")
-        ax.fill_between(bpos, pred, color="#4273c8", alpha=0.6,
-                        label="Predicted", step="mid")
-        ax.axvline(summit, color="darkred", lw=1.2, linestyle=":",
-                   label=f"Peak summit @ {summit:,}")
-        rv = stats.pearsonr(pred, obs)[0]
-        rh = stats.spearmanr(pred, obs)[0]
-        ax.set_title(f"{r['chrom']}:{r['start']:,}–{r['end']:,}  |  "
-                     f"Pearson r={rv:.3f}  Spearman ρ={rh:.3f}  "
-                     f"obs_max={obs.max():.2f}", fontsize=9)
-        ax.set_ylabel("Signal (128-bp bins)", fontsize=9)
-        ax.legend(fontsize=8, loc="upper right")
-        ax.grid(True, alpha=0.3)
-        ax.set_xlabel(f"Position on {r['chrom']} (bp)", fontsize=9)
-    plt.suptitle("Top-N Peak Signal Windows  [Hybrid AlphaGenome · mm10]",
-                 fontsize=12, y=1.01)
-    plt.tight_layout()
-    out = os.path.join(run_dir, "eval_peak_tracks.png")
-    plt.savefig(out, dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"  Saved → {out}", flush=True)
+    """Paper-style peak-track plot: top-N windows by observed signal,
+    with predicted and observed as separate stacked panels.
+    """
+    top  = sorted(results, key=lambda r: r["obs"].max(), reverse=True)[:n]
+    figs = [_build_track_fig(r, window_size, bin_size) for r in top]
+    _stitch_figs_vertically(figs, os.path.join(run_dir, "eval_peak_tracks.png"))
 
 
 def plot_correlation(metrics_df, global_r, global_rho,

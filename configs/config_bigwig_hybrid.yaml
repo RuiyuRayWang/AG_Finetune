@@ -42,6 +42,7 @@ epochs: 10
 freeze_epochs: 2        # Phase 1 length: epochs to keep trunk fully frozen
 batch_size: 8
 learning_rate: 5e-4     # Peak LR used in both phases
+weight_decay: 0.04      # AdamW weight decay (paper pre-training: 0.4, distillation: 0.04)
 checkpoint_interval: 0    # Mid-epoch crash-recovery saves. Disabled: no resume logic exists, so these are never used.
 
 
@@ -51,7 +52,7 @@ lora_alpha: 16.0        # LoRA alpha scaling factor (effective LR = alpha/rank =
 
 
 # DATA & AUGMENTATION
-window_size: 131072     # 2^17 bp
+window_size: 8192       # 2^13 bp — covers AAV genome (~4.7 kb) with ~1.75 kb flanking on each side
 organism_id: 1          # 0=human, 1=mouse
 augment: true
 max_shift: 1024

@@ -280,6 +280,7 @@ class HybridAlphaGenomeModel:
         apply_fn: Callable,
         mesh: Optional[Mesh] = None,
         learning_rate: float = 5e-4,
+        weight_decay: float = 0.04,
         lora_rank: int = 8,
         lora_alpha: float = 16.0,
         warmup_steps: int = 0,
@@ -293,7 +294,9 @@ class HybridAlphaGenomeModel:
             state:               Model state (BatchNorm EMAs).
             apply_fn:            ``apply_fn(params, state, seq, org) -> predictions``.
             mesh:                JAX device mesh for data-parallel training.
-            learning_rate:       Peak Adam LR used in both phases.
+            learning_rate:       Peak AdamW LR used in both phases.
+            weight_decay:        AdamW weight decay (paper pre-training: 0.4,
+                                 distillation: 0.04; default 0.04 for fine-tuning).
             lora_rank:           LoRA rank for Phase 2 (default 8).
             lora_alpha:          LoRA alpha scaling for Phase 2 (default 16.0).
             warmup_steps:        Warmup steps for Phase 2 cosine schedule.
@@ -309,6 +312,7 @@ class HybridAlphaGenomeModel:
 
         # Guard against YAML parsing 5e-4 as a string on some PyYAML versions
         learning_rate        = float(learning_rate)
+        weight_decay         = float(weight_decay)
         lora_rank            = int(lora_rank)
         lora_alpha           = float(lora_alpha)
         warmup_steps         = int(warmup_steps)
@@ -352,7 +356,7 @@ class HybridAlphaGenomeModel:
                 peak_value=learning_rate,
                 warmup_steps=freeze_warmup_steps,
                 decay_steps=freeze_total_steps,
-                end_value=learning_rate * 0.1,
+                end_value=0.0,
             )
             print(f"  [Phase 1] LR warmup: {freeze_warmup_steps} steps, "
                   f"cosine over {freeze_total_steps} steps")
@@ -361,7 +365,7 @@ class HybridAlphaGenomeModel:
 
         self._head_optimizer = optax.chain(
             optax.clip_by_global_norm(0.5),
-            optax.adam(freeze_lr),
+            optax.adamw(freeze_lr, weight_decay=weight_decay),
         )
         self._head_opt_state = self._head_optimizer.init(self.head_params)
 
@@ -372,7 +376,7 @@ class HybridAlphaGenomeModel:
                 peak_value=learning_rate,
                 warmup_steps=warmup_steps,
                 decay_steps=total_steps,
-                end_value=learning_rate * 0.1,
+                end_value=0.0,
             )
             print(f"  [Phase 2] LR warmup: {warmup_steps} steps, "
                   f"cosine over {total_steps} steps")
@@ -381,7 +385,7 @@ class HybridAlphaGenomeModel:
 
         self._lora_optimizer = optax.chain(
             optax.clip_by_global_norm(0.5),
-            optax.adam(lora_lr),
+            optax.adamw(lora_lr, weight_decay=weight_decay),
         )
         self._lora_opt_state = None  # Created in activate_lora()
 
@@ -730,7 +734,7 @@ def train(
     freeze_epochs: int = 2,
     batch_size: int = 8,
     learning_rate: float = 5e-4,
-    window_size: int = 131072,
+    window_size: int = 8192,
     organism_id: int = 1,
     genome_windows: str = None,
     augment: bool = True,
@@ -742,6 +746,7 @@ def train(
     checkpoint_interval: int = 20,
     lora_rank: int = 8,
     lora_alpha: float = 16.0,
+    weight_decay: float = 0.04,
 ):
     """Fine-tune AlphaGenome with the two-phase hybrid curriculum."""
 
@@ -922,6 +927,7 @@ def train(
         apply_fn=new_apply_fn,
         mesh=mesh,
         learning_rate=learning_rate,
+        weight_decay=weight_decay,
         lora_rank=lora_rank,
         lora_alpha=lora_alpha,
         warmup_steps=lora_warmup_steps,
@@ -1121,9 +1127,10 @@ def main():
     freeze_epochs = get_value(args.freeze_epochs, 'freeze_epochs', 2)
     lora_rank     = get_value(args.lora_rank,     'lora_rank',     8)
     lora_alpha    = get_value(args.lora_alpha,    'lora_alpha',    16.0)
+    weight_decay  = get_value(None,               'weight_decay',  0.04)
     batch_size    = get_value(args.batch_size,    'batch_size',    8)
     lr            = get_value(args.lr,            'learning_rate', 5e-4)
-    window_size   = get_value(args.window_size,   'window_size',   131072)
+    window_size   = get_value(args.window_size,   'window_size',   8192)
     organism      = get_value(args.organism,      'organism_id',   1)
     windows_bed   = get_value(args.windows_bed,   'windows_bed',   None)
     chrom_sizes   = get_value(args.chrom_sizes,   'chrom_sizes',   None)
@@ -1164,6 +1171,7 @@ def main():
         checkpoint_interval=checkpoint_interval,
         lora_rank=lora_rank,
         lora_alpha=lora_alpha,
+        weight_decay=weight_decay,
     )
 
 
