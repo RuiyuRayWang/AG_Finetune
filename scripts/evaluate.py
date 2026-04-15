@@ -121,21 +121,24 @@ def _build_eval_windows(
 # Model loading
 # ══════════════════════════════════════════════════════════════════════════════
 
-def load_model(checkpoint_dir: str, signal_path: str, fasta_path: str):
-    """Load fine-tuned AlphaGenome with 1-track ATAC metadata."""
+def load_model(checkpoint_dir: str, signal_paths: list[str], fasta_path: str):
+    """Load fine-tuned AlphaGenome with N-track ATAC metadata."""
     _banner("Loading fine-tuned model")
-    print(f"  Checkpoint : {checkpoint_dir}")
-    print(f"  FASTA      : {fasta_path}")
-    print(f"  JAX devices: {jax.devices()}", flush=True)
+    print(f"  Checkpoint  : {checkpoint_dir}")
+    print(f"  FASTA       : {fasta_path}")
+    print(f"  Tracks      : {len(signal_paths)}")
+    print(f"  JAX devices : {jax.devices()}", flush=True)
 
-    # Reconstruct the exact 1-track metadata used during training
-    # (matches tf_ft_hybrid.py lines 869–875)
-    track_df = pd.DataFrame([{
-        "output_type": "ATAC",
-        "name":        "CUT&Tag",
-        "strand":      ".",
-        "file_path":   signal_path,
-    }])
+    # Reconstruct the exact N-track metadata used during training
+    track_df = pd.DataFrame([
+        {
+            "output_type": "ATAC",
+            "name":        os.path.splitext(os.path.basename(p))[0],
+            "strand":      ".",
+            "file_path":   p,
+        }
+        for p in signal_paths
+    ])
     fine_tune_metadata = metadata_lib.AlphaGenomeOutputMetadata(atac=track_df)
 
     organism = dna_model.Organism.MUS_MUSCULUS
@@ -194,21 +197,25 @@ def run_predictions(
     model,
     organism,
     eval_windows: list[tuple[str, int, int]],
-    signal_path: str,
+    signal_paths: list[str],
     window_size: int,
-    track_mean: float = 1.0,
+    track_means,          # float | list[float] | np.ndarray — one per track
 ) -> list[dict]:
     """Predict + fetch ground-truth for every eval window.
 
-    ``track_mean`` (from training_config.json) is used to apply the inverse
-    AlphaGenome targets_scaling transform so predictions are in the same
-    count space as the BigWig signal.
+    Supports N signal tracks; ``results`` contain pred/obs as
+    ``[window_size, N]`` arrays. ``track_means`` (from training_config.json)
+    is used to apply the inverse AlphaGenome targets_scaling per track.
     """
-    _banner(f"Running predictions on {len(eval_windows)} windows")
-    print(f"  track_mean = {track_mean:.6f}  (inverse-scaling to count space)",
-          flush=True)
+    track_means = np.asarray(track_means, dtype=np.float32).reshape(-1)
+    num_tracks  = len(signal_paths)
+    _banner(f"Running predictions on {len(eval_windows)} windows  ({num_tracks} track(s))")
+    for i, (sp, tm) in enumerate(zip(signal_paths, track_means)):
+        print(f"  track [{i}] track_mean={tm:.6f}  {os.path.basename(sp)}",
+              flush=True)
+
     results = []
-    bw = pyBigWig.open(signal_path)
+    bws = [pyBigWig.open(sp) for sp in signal_paths]
 
     for i, (chrom, start, end) in enumerate(eval_windows):
         print(f"  [{i+1}/{len(eval_windows)}] {chrom}:{start:,}–{end:,} …",
@@ -223,22 +230,28 @@ def run_predictions(
         )
 
         # TrackData.values shape: [window_size, num_tracks]
-        raw      = preds.atac.values
-        # Model outputs are in the transformed space (after targets_scaling);
-        # apply the inverse to get back to original count units.
-        pred_scaled = np.array(raw[:, 0], dtype=np.float32)
-        pred_arr = np.array(
-            alphagenome_predictions_scaling(
-                jnp.array(pred_scaled), track_mean=track_mean
-            ),
-            dtype=np.float32,
-        )
+        raw = np.array(preds.atac.values, dtype=np.float32)   # [W, T]
 
-        obs_raw  = bw.values(chrom, start, end, numpy=True)
-        obs_arr  = np.nan_to_num(obs_raw, nan=0.0).astype(np.float32)
+        # Apply inverse scaling per track — back to count space
+        pred_arr = np.stack([
+            np.array(
+                alphagenome_predictions_scaling(
+                    jnp.array(raw[:, t]), track_mean=float(track_means[t])
+                ),
+                dtype=np.float32,
+            )
+            for t in range(num_tracks)
+        ], axis=1)  # [W, T]
 
-        assert len(pred_arr) == window_size, f"pred len={len(pred_arr)}"
-        assert len(obs_arr)  == window_size, f"obs  len={len(obs_arr)}"
+        obs_arr = np.stack([
+            np.nan_to_num(
+                bw.values(chrom, start, end, numpy=True), nan=0.0
+            ).astype(np.float32)
+            for bw in bws
+        ], axis=1)  # [W, T]
+
+        assert pred_arr.shape[0] == window_size, f"pred shape={pred_arr.shape}"
+        assert obs_arr.shape[0]  == window_size, f"obs  shape={obs_arr.shape}"
 
         elapsed = time.time() - t0
         print(f"pred_max={pred_arr.max():.4f}  obs_max={obs_arr.max():.4f}"
@@ -248,11 +261,12 @@ def run_predictions(
             "chrom": chrom,
             "start": start,
             "end":   end,
-            "pred":  pred_arr,
-            "obs":   obs_arr,
+            "pred":  pred_arr,   # [window_size, num_tracks]
+            "obs":   obs_arr,    # [window_size, num_tracks]
         })
 
-    bw.close()
+    for bw in bws:
+        bw.close()
     print(f"\n  ✓ Done: {len(results)} windows.", flush=True)
     return results
 
@@ -261,37 +275,64 @@ def run_predictions(
 # Metrics
 # ══════════════════════════════════════════════════════════════════════════════
 
-def compute_metrics(results: list[dict], window_size: int, bin_size: int = 128):
-    rows      = []
-    all_pred  = []
-    all_obs   = []
+def compute_metrics(
+    results: list[dict],
+    window_size: int,
+    track_names: list[str],
+    bin_size: int = 128,
+):
+    """Compute per-track, per-window Pearson r / Spearman ρ / MSE / MAE.
+
+    Returns
+    -------
+    df          : DataFrame with columns [track, chrom, start, end, pearson_r, ...]
+    global_r    : dict {track_name -> global Pearson r}
+    global_rho  : dict {track_name -> global Spearman rho}
+    all_pred    : dict {track_name -> concatenated pred bins (float32)}
+    all_obs     : dict {track_name -> concatenated obs bins (float32)}
+    """
+    num_tracks   = results[0]["pred"].shape[1]
+    rows         = []
+    track_preds  = [[] for _ in range(num_tracks)]
+    track_obs    = [[] for _ in range(num_tracks)]
 
     for r in results:
-        n_bins = window_size // bin_size
-        pred_b = r["pred"].reshape(n_bins, bin_size).mean(axis=1)
-        obs_b  = r["obs"].reshape(n_bins, bin_size).mean(axis=1)
+        n_bins     = window_size // bin_size
+        pred_bins  = r["pred"].reshape(n_bins, bin_size, num_tracks).mean(axis=1)  # [B, T]
+        obs_bins   = r["obs"].reshape(n_bins,  bin_size, num_tracks).mean(axis=1)
 
-        pearson_r,  _ = stats.pearsonr(pred_b, obs_b)
-        spearman_r, _ = stats.spearmanr(pred_b, obs_b)
-        rows.append({
-            "chrom":      r["chrom"],
-            "start":      r["start"],
-            "end":        r["end"],
-            "pearson_r":  pearson_r,
-            "spearman_r": spearman_r,
-            "mse":        float(np.mean((pred_b - obs_b) ** 2)),
-            "mae":        float(np.mean(np.abs(pred_b - obs_b))),
-        })
-        all_pred.append(pred_b)
-        all_obs.append(obs_b)
+        for t, name in enumerate(track_names):
+            pb = pred_bins[:, t]
+            ob = obs_bins[:, t]
+            pearson_r,  _ = stats.pearsonr(pb, ob)
+            spearman_r, _ = stats.spearmanr(pb, ob)
+            rows.append({
+                "track":      name,
+                "chrom":      r["chrom"],
+                "start":      r["start"],
+                "end":        r["end"],
+                "pearson_r":  pearson_r,
+                "spearman_r": spearman_r,
+                "mse":        float(np.mean((pb - ob) ** 2)),
+                "mae":        float(np.mean(np.abs(pb - ob))),
+            })
+            track_preds[t].append(pb)
+            track_obs[t].append(ob)
 
-    all_pred_flat = np.concatenate(all_pred)
-    all_obs_flat  = np.concatenate(all_obs)
-    global_r,   _ = stats.pearsonr(all_pred_flat, all_obs_flat)
-    global_rho, _ = stats.spearmanr(all_pred_flat, all_obs_flat)
+    df         = pd.DataFrame(rows)
+    global_r   = {}
+    global_rho = {}
+    all_pred   = {}
+    all_obs    = {}
+    for t, name in enumerate(track_names):
+        pf = np.concatenate(track_preds[t])
+        of = np.concatenate(track_obs[t])
+        global_r[name],   _ = stats.pearsonr(pf, of)
+        global_rho[name], _ = stats.spearmanr(pf, of)
+        all_pred[name]       = pf
+        all_obs[name]        = of
 
-    df = pd.DataFrame(rows)
-    return df, global_r, global_rho, all_pred_flat, all_obs_flat
+    return df, global_r, global_rho, all_pred, all_obs
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -310,17 +351,22 @@ def _build_track_fig(
     r: dict,
     window_size: int,
     bin_size: int,
+    track_idx: int = 0,
+    track_name: str = "CUT&Tag",
     fig_width: int = 14,
 ) -> matplotlib.figure.Figure:
     """Return a plot_components figure with pred (top) and obs (bottom) as
-    separate filled tracks for one genomic window.
+    separate filled tracks for one genomic window and one signal track.
 
     Uses ``alphagenome.visualization.plot_components`` — the same API used in
     the AlphaGenome paper figures — so the layout and styling match the paper.
     """
-    nb = window_size // bin_size
-    pred_b = r["pred"].reshape(nb, bin_size).mean(axis=1).astype(np.float32)
-    obs_b  = r["obs"].reshape(nb, bin_size).mean(axis=1).astype(np.float32)
+    nb         = window_size // bin_size
+    num_tracks = r["pred"].shape[1]
+    pred_b = (r["pred"].reshape(nb, bin_size, num_tracks).mean(axis=1)
+              [:, track_idx].astype(np.float32))
+    obs_b  = (r["obs"].reshape(nb,  bin_size, num_tracks).mean(axis=1)
+              [:, track_idx].astype(np.float32))
 
     chrom, start, end = r["chrom"], r["start"], r["end"]
     interval = genome_lib.Interval(chrom, start, end)
@@ -328,13 +374,13 @@ def _build_track_fig(
     # Build TrackData objects; metadata needs at least 'name' and 'strand'.
     pred_tdata = track_data_lib.TrackData(
         values=pred_b.reshape(-1, 1),
-        metadata=pd.DataFrame([{"name": "Predicted", "strand": "."}]),
+        metadata=pd.DataFrame([{"name": f"Predicted [{track_name}]", "strand": "."}]),
         resolution=bin_size,
         interval=interval,
     )
     obs_tdata = track_data_lib.TrackData(
         values=obs_b.reshape(-1, 1),
-        metadata=pd.DataFrame([{"name": "Observed", "strand": "."}]),
+        metadata=pd.DataFrame([{"name": f"Observed [{track_name}]", "strand": "."}]),
         resolution=bin_size,
         interval=interval,
     )
@@ -475,63 +521,91 @@ def plot_training_curves(metrics_csv: str, run_dir: str) -> None:
     print(f"  Saved → {out}", flush=True)
 
 
-def plot_tracks(results: list[dict], window_size: int,
+def plot_tracks(results: list[dict], window_size: int, track_names: list[str],
                 run_dir: str, n: int = 4, bin_size: int = 128) -> None:
-    """Paper-style track plot: predicted and observed as separate stacked panels.
-
-    Uses ``plot_components.Tracks`` (filled) — the same component used in
-    AlphaGenome paper figures — so each track gets its own panel.
+    """Paper-style track plot: one PNG per signal track with predicted and
+    observed as separate stacked panels.
     """
-    figs = [_build_track_fig(r, window_size, bin_size) for r in results[:n]]
-    _stitch_figs_vertically(figs, os.path.join(run_dir, "pred_vs_obs_tracks.png"))
+    for t, name in enumerate(track_names):
+        figs = [
+            _build_track_fig(r, window_size, bin_size, track_idx=t, track_name=name)
+            for r in results[:n]
+        ]
+        tag = name.replace("/", "_").replace(" ", "_")
+        _stitch_figs_vertically(
+            figs, os.path.join(run_dir, f"pred_vs_obs_tracks_{tag}.png")
+        )
 
 
-def plot_peak_tracks(results: list[dict], window_size: int,
+def plot_peak_tracks(results: list[dict], window_size: int, track_names: list[str],
                      run_dir: str, n: int = 4, bin_size: int = 128) -> None:
-    """Paper-style peak-track plot: top-N windows by observed signal,
-    with predicted and observed as separate stacked panels.
+    """Paper-style peak-track plot: top-N windows by per-track observed signal,
+    one PNG per signal track.
     """
-    top  = sorted(results, key=lambda r: r["obs"].max(), reverse=True)[:n]
-    figs = [_build_track_fig(r, window_size, bin_size) for r in top]
-    _stitch_figs_vertically(figs, os.path.join(run_dir, "eval_peak_tracks.png"))
+    for t, name in enumerate(track_names):
+        top = sorted(
+            results, key=lambda r, _t=t: r["obs"][:, _t].max(), reverse=True
+        )[:n]
+        figs = [
+            _build_track_fig(r, window_size, bin_size, track_idx=t, track_name=name)
+            for r in top
+        ]
+        tag = name.replace("/", "_").replace(" ", "_")
+        _stitch_figs_vertically(
+            figs, os.path.join(run_dir, f"eval_peak_tracks_{tag}.png")
+        )
 
 
 def plot_correlation(metrics_df, global_r, global_rho,
-                     all_pred_flat, all_obs_flat, run_dir: str) -> None:
-    fig, (ax_sc, ax_bar) = plt.subplots(1, 2, figsize=(14, 5))
+                     all_pred, all_obs, run_dir: str) -> None:
+    """One column of (scatter + bar) subplots per signal track."""
+    track_names = list(global_r.keys())
+    num_tracks  = len(track_names)
 
+    fig, axes = plt.subplots(2, num_tracks,
+                             figsize=(10 * num_tracks, 10),
+                             squeeze=False)
     rng = np.random.default_rng(42)
-    idx = rng.choice(len(all_pred_flat),
-                     size=min(40_000, len(all_pred_flat)), replace=False)
-    h = ax_sc.hexbin(all_obs_flat[idx], all_pred_flat[idx],
-                     gridsize=80, mincnt=1, cmap="YlOrRd", bins="log")
-    plt.colorbar(h, ax=ax_sc, label="log₁₀(count)")
-    vmax = max(all_obs_flat.max(), all_pred_flat.max()) * 1.05
-    ax_sc.plot([0, vmax], [0, vmax], "k--", lw=1.2, label="y = x")
-    ax_sc.set_xlabel("Observed signal (128-bp bin)", fontsize=10)
-    ax_sc.set_ylabel("Predicted signal (128-bp bin)", fontsize=10)
-    ax_sc.set_title(f"Predicted vs Observed\n"
-                    f"Pearson r = {global_r:.3f}  |  Spearman ρ = {global_rho:.3f}",
-                    fontsize=10)
-    ax_sc.legend(fontsize=9)
-    ax_sc.grid(True, alpha=0.3)
 
-    bar_colors = [CHROM_COLORS.get(r, "#888") for r in metrics_df["chrom"]]
-    ax_bar.bar(range(len(metrics_df)), metrics_df["pearson_r"],
-               color=bar_colors, edgecolor="k", linewidth=0.4)
-    ax_bar.axhline(global_r, color="red", lw=1.5, linestyle="--",
-                   label=f"Global r = {global_r:.3f}")
-    ax_bar.set_xticks(range(len(metrics_df)))
-    ax_bar.set_xticklabels(
-        [f"{row['chrom']}\n{row['start']//1000}k"
-         for _, row in metrics_df.iterrows()],
-        fontsize=7, rotation=45)
-    ax_bar.set_ylabel("Pearson r", fontsize=10)
-    ax_bar.set_title("Per-window Pearson r", fontsize=10)
-    ax_bar.grid(True, axis="y", alpha=0.3)
-    for chrom, c in CHROM_COLORS.items():
-        ax_bar.bar([], [], color=c, label=chrom)
-    ax_bar.legend(fontsize=8)
+    for col, name in enumerate(track_names):
+        ax_sc  = axes[0, col]
+        ax_bar = axes[1, col]
+        pf   = all_pred[name]
+        of   = all_obs[name]
+        gr   = global_r[name]
+        grho = global_rho[name]
+
+        idx = rng.choice(len(pf), size=min(40_000, len(pf)), replace=False)
+        h = ax_sc.hexbin(of[idx], pf[idx],
+                     gridsize=80, mincnt=1, cmap="YlOrRd", bins="log")
+        plt.colorbar(h, ax=ax_sc, label="log₁₀(count)")
+        vmax = max(float(of.max()), float(pf.max())) * 1.05
+        ax_sc.plot([0, vmax], [0, vmax], "k--", lw=1.2, label="y = x")
+        ax_sc.set_xlabel("Observed signal (128-bp bin)", fontsize=10)
+        ax_sc.set_ylabel("Predicted signal (128-bp bin)", fontsize=10)
+        ax_sc.set_title(
+            f"{name}\nPearson r = {gr:.3f}  |  Spearman ρ = {grho:.3f}",
+            fontsize=10)
+        ax_sc.legend(fontsize=9)
+        ax_sc.grid(True, alpha=0.3)
+
+        sub_df     = metrics_df[metrics_df["track"] == name]
+        bar_colors = [CHROM_COLORS.get(r, "#888") for r in sub_df["chrom"]]
+        ax_bar.bar(range(len(sub_df)), sub_df["pearson_r"],
+                   color=bar_colors, edgecolor="k", linewidth=0.4)
+        ax_bar.axhline(gr, color="red", lw=1.5, linestyle="--",
+                       label=f"Global r = {gr:.3f}")
+        ax_bar.set_xticks(range(len(sub_df)))
+        ax_bar.set_xticklabels(
+            [f"{row['chrom']}\n{row['start']//1000}k"
+             for _, row in sub_df.iterrows()],
+            fontsize=7, rotation=45)
+        ax_bar.set_ylabel("Pearson r", fontsize=10)
+        ax_bar.set_title(f"Per-window Pearson r\n{name}", fontsize=10)
+        ax_bar.grid(True, axis="y", alpha=0.3)
+        for chrom, c in CHROM_COLORS.items():
+            ax_bar.bar([], [], color=c, label=chrom)
+        ax_bar.legend(fontsize=8)
 
     plt.tight_layout()
     out = os.path.join(run_dir, "eval_correlation.png")
@@ -550,7 +624,7 @@ def main():
     parser.add_argument("--run-dir",    default=DEFAULT_RUN_DIR,
                         help="Training run directory (contains best_checkpoint/)")
     parser.add_argument("--signal",     default=DEFAULT_SIGNAL,
-                        help="Path to CUT&Tag BigWig signal file")
+                        help="Fallback BigWig path if not in training_config.json")
     parser.add_argument("--fasta",      default=DEFAULT_FASTA)
     parser.add_argument("--chrom-sizes",default=DEFAULT_CHROM_SIZES)
     parser.add_argument("--test-chroms",default=",".join(DEFAULT_TEST_CHROMS),
@@ -566,13 +640,10 @@ def main():
     run_dir     = args.run_dir
     ckpt_dir    = os.path.join(run_dir, "best_checkpoint", "model")
     metrics_csv = os.path.join(run_dir, "metrics.csv")
-    test_chroms = [c.strip() for c in args.test_chroms.split(",")]
 
     _banner("AlphaGenome Fine-tuned Evaluation")
     print(f"  Run dir    : {run_dir}")
     print(f"  Checkpoint : {ckpt_dir}")
-    print(f"  Signal     : {args.signal}")
-    print(f"  Test chroms: {test_chroms}")
     print(f"  Windows    : {args.windows_per_chrom} per chrom", flush=True)
 
     # ── Load training config ───────────────────────────────────────────────
@@ -585,25 +656,61 @@ def main():
         for k, v in cfg.items():
             print(f"    {k:<22}: {v}")
 
-    # Resolve track_mean: prefer training_config.json, fall back to computing
-    # it directly from the BigWig (older runs pre-date this field).
-    if "track_mean" in cfg:
-        track_mean = float(cfg["track_mean"])
-        print(f"\n  track_mean (from config): {track_mean:.6f}", flush=True)
+    # ── Resolve signal paths ───────────────────────────────────────────────
+    # Priority: training_config.json `signal_paths` > `signal_path` > CLI --signal
+    if "signal_paths" in cfg:
+        signal_paths = cfg["signal_paths"]
+        print(f"\n  signal_paths (from config, {len(signal_paths)} tracks):", flush=True)
+        for p in signal_paths:
+            print(f"    {p}")
+    elif "signal_path" in cfg:
+        signal_paths = [cfg["signal_path"]]
+        print(f"\n  signal_path (from config): {signal_paths[0]}", flush=True)
     else:
-        print("\n  track_mean not found in config — computing from BigWig...",
-              flush=True)
-        track_mean = compute_track_mean_from_bigwig(
-            args.signal, chrom_sizes_path=args.chrom_sizes
-        )
-        print(f"  track_mean (computed)   : {track_mean:.6f}", flush=True)
+        signal_paths = [args.signal]
+        print(f"\n  signal (from CLI): {signal_paths[0]}", flush=True)
+
+    # ── Resolve window_size from config if not overridden on CLI ──────────
+    if args.window_size == DEFAULT_WINDOW_SIZE and "window_size" in cfg:
+        window_size = int(cfg["window_size"])
+        print(f"\n  window_size (from config): {window_size}", flush=True)
+    else:
+        window_size = args.window_size
+
+    # ── Resolve test_chroms from config if not overridden on CLI ──────────
+    cli_test_chroms = [c.strip() for c in args.test_chroms.split(",")]
+    if cli_test_chroms == DEFAULT_TEST_CHROMS and "test_chroms" in cfg:
+        test_chroms = list(cfg["test_chroms"])
+        print(f"  test_chroms (from config): {test_chroms}", flush=True)
+    else:
+        test_chroms = cli_test_chroms
+
+    # ── Resolve track_means ────────────────────────────────────────────────
+    # Priority: config `track_means` > config `track_mean` > compute from BigWig
+    if "track_means" in cfg:
+        track_means = list(cfg["track_means"])
+        print(f"\n  track_means (from config): {track_means}", flush=True)
+    elif "track_mean" in cfg:
+        track_means = [float(cfg["track_mean"])]
+        print(f"\n  track_mean (from config): {track_means[0]:.6f}", flush=True)
+    else:
+        print("\n  track_means not in config — computing from BigWig(s)...", flush=True)
+        track_means = [
+            compute_track_mean_from_bigwig(p, chrom_sizes_path=args.chrom_sizes)
+            for p in signal_paths
+        ]
+        for p, tm in zip(signal_paths, track_means):
+            print(f"    {os.path.basename(p)}: {tm:.6f}")
+
+    # Short names for plots (basename without extension)
+    track_names = [os.path.splitext(os.path.basename(p))[0] for p in signal_paths]
 
     # ── Load model ─────────────────────────────────────────────────────────
-    model, organism = load_model(ckpt_dir, args.signal, args.fasta)
+    model, organism = load_model(ckpt_dir, signal_paths, args.fasta)
 
     # ── Sanity check ───────────────────────────────────────────────────────
     if not args.skip_sanity:
-        sanity_check(model, organism, args.window_size)
+        sanity_check(model, organism, window_size)
 
     # ── Training curves ────────────────────────────────────────────────────
     if os.path.exists(metrics_csv):
@@ -615,25 +722,26 @@ def main():
     # ── Build eval windows ─────────────────────────────────────────────────
     chrom_sizes  = _load_chrom_sizes(args.chrom_sizes)
     eval_windows = _build_eval_windows(
-        chrom_sizes, test_chroms, args.window_size, args.windows_per_chrom)
+        chrom_sizes, test_chroms, window_size, args.windows_per_chrom)
     print(f"\n  Evaluation windows ({len(eval_windows)}):")
     for w in eval_windows:
         print(f"    {w[0]}:{w[1]:,}–{w[2]:,}")
 
     # ── Predictions ────────────────────────────────────────────────────────
     results = run_predictions(model, organism, eval_windows,
-                              args.signal, args.window_size,
-                              track_mean=track_mean)
+                              signal_paths, window_size,
+                              track_means=track_means)
 
     # ── Metrics ────────────────────────────────────────────────────────────
     _banner("Computing metrics")
     metrics_df, global_r, global_rho, all_pred, all_obs = compute_metrics(
-        results, args.window_size, args.bin_size)
+        results, window_size, track_names, args.bin_size)
 
     print(f"\n  Per-window metrics ({args.bin_size}-bp bins):")
     print(metrics_df.to_string(index=False, float_format="%.4f"))
-    print(f"\n  Global Pearson r   : {global_r:.4f}")
-    print(f"  Global Spearman ρ  : {global_rho:.4f}")
+    for name in track_names:
+        print(f"\n  [{name}]  Global Pearson r = {global_r[name]:.4f}"
+              f"   Global Spearman rho = {global_rho[name]:.4f}")
 
     out_csv = os.path.join(run_dir, "eval_metrics.csv")
     metrics_df.to_csv(out_csv, index=False)
@@ -641,8 +749,8 @@ def main():
 
     # ── Plots ──────────────────────────────────────────────────────────────
     _banner("Generating plots")
-    plot_tracks(results, args.window_size, run_dir)
-    plot_peak_tracks(results, args.window_size, run_dir)
+    plot_tracks(results, window_size, track_names, run_dir)
+    plot_peak_tracks(results, window_size, track_names, run_dir)
     plot_correlation(metrics_df, global_r, global_rho, all_pred, all_obs, run_dir)
 
     _banner("DONE")

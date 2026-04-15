@@ -1,0 +1,14 @@
+{
+  "files.watcherExclude": {
+    "**/.jax_cache/**": true,
+    "**/data/**": true
+  },
+  "files.exclude": {
+    ".jax_cache": true
+  },
+  "search.exclude": {
+    "**/.jax_cache/**": true,
+    "**/data/**": true
+  },
+  "github.copilot.chat.search.semanticTextResults": false
+}

@@ -21,7 +21,10 @@
 # PATHS (Required)
 checkpoint: /home/ray/AG_Finetune/checkpoints/pre_trained/alphagenome-all-folds
 fasta: /home/ray/AG_Finetune/data/resources/mm10.fa
-signal: /home/ray/AG_Finetune/data/CUTTag/ZHY-250227-1/ZHY-250227-1_ACTGCATATAAGGCGA/alignment/bigwig/ZHY-250227-1_ACTGCATATAAGGCGA_bowtie2.chrombpnet_reads_to_bw_unstranded.bw
+signals: 
+  - /home/ray/AG_Finetune/data/CUTTag/processed_bigwig/GPe-PV_H3K27ac_averaged_normalized.bigwig
+  - /home/ray/AG_Finetune/data/CUTTag/processed_bigwig/GPe-PV_H3K27me3_averaged_normalized.bigwig
+  
 output: /home/ray/AG_Finetune/checkpoints/fine_tuned
 
 ## Optional: BED file with specific genomic windows to use for training
@@ -40,22 +43,32 @@ precision_policy: params=float32,compute=float32,output=float32
 # TRAINING HYPERPARAMETERS
 epochs: 10
 freeze_epochs: 2        # Phase 1 length: epochs to keep trunk fully frozen
-batch_size: 8
-learning_rate: 5e-4     # Peak LR used in both phases
+batch_size: 4
+learning_rate: 3e-4     # Peak LR used in both phases
 weight_decay: 0.04      # AdamW weight decay (paper pre-training: 0.4, distillation: 0.04)
 checkpoint_interval: 0    # Mid-epoch crash-recovery saves. Disabled: no resume logic exists, so these are never used.
 
 
 # LORA CONFIGURATION (Phase 2)
-lora_rank: 8            # LoRA rank — increase to 32/64 if Phase 2 plateaus early
-lora_alpha: 16.0        # LoRA alpha scaling factor (effective LR = alpha/rank = 2.0)
+lora_rank: 16           # LoRA rank — increase to 32/64 if Phase 2 plateaus early
+lora_alpha: 32.0        # LoRA alpha scaling factor (effective LR = alpha/rank = 2.0)
 
 
 # DATA & AUGMENTATION
 window_size: 8192       # 2^13 bp — covers AAV genome (~4.7 kb) with ~1.75 kb flanking on each side
 organism_id: 1          # 0=human, 1=mouse
 augment: true
-max_shift: 1024
+max_shift: 256
+
+
+# CHROMOSOME SPLITS (mm10)
+# Chromosomes held out for validation (used for early stopping / best checkpoint selection)
+val_chroms:
+  - chr7
+# Chromosomes held out for testing (never seen during training — for final evaluation only)
+test_chroms:
+  - chr8
+  - chr9
 
 
 # SYSTEM

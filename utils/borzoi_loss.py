@@ -458,7 +458,7 @@ def alphagenome_targets_scaling(
     targets = jnp.maximum(targets, 0.0)
 
     # 1. Normalise by genome-wide non-zero mean
-    targets = targets / float(track_mean)
+    targets = targets / jnp.asarray(track_mean, dtype=jnp.float32)
 
     # 2. Optional power squashing (RNA-seq only)
     if apply_squashing:
@@ -508,7 +508,7 @@ def alphagenome_predictions_scaling(
         predictions = predictions ** (1.0 / 0.75)
 
     # Inverse mean normalisation
-    predictions = predictions * float(track_mean)
+    predictions = predictions * jnp.asarray(track_mean, dtype=jnp.float32)
 
     predictions = jnp.where(jnp.isfinite(predictions), predictions, 0.0)
     predictions = jnp.maximum(predictions, 0.0)
@@ -518,29 +518,27 @@ def alphagenome_predictions_scaling(
 def cut_and_tag_loss_alphagenome(
     predictions,
     targets: jnp.ndarray,
-    track_mean: float,
+    track_means,
     total_weight: float = 1.0,
     epsilon: float = 1e-6,
 ) -> float:
     """
     CUT&Tag loss using AlphaGenome's exact ``targets_scaling`` from the paper.
 
-    Replaces ``cut_and_tag_loss_baskerville``.  The only difference is that
-    targets are normalised by ``track_mean`` (genome-wide non-zero mean) then
-    smooth-clipped at 10, matching AlphaGenome's pre-training procedure.
+    Supports single-track (``track_means`` is a scalar float) and multi-track
+    (``track_means`` is a 1-D array of shape [N], one value per BigWig).
 
-    ``track_mean`` is a static float frozen into the callable via
-    ``functools.partial`` before JIT compilation::
-
-        loss_fn = functools.partial(
-            cut_and_tag_loss_alphagenome, track_mean=track_mean
-        )
+    For multi-track, ``targets`` must be ``[batch, seq_len, N]`` and
+    predictions output ``scaled_predictions_1bp`` of shape
+    ``[batch, seq_len, N]``.  The loss is averaged across all tracks.
 
     Args:
-        predictions: Model output array [batch, seq_len] or [batch, seq_len, 1].
-        targets: Raw CUT&Tag counts [batch, seq_len].
-        track_mean: Genome-wide mean of non-zero values (from
-            ``compute_track_mean_from_bigwig``).
+        predictions: Model output dict or array.
+        targets: Raw counts ``[batch, seq_len]`` (single) or
+            ``[batch, seq_len, N]`` (multi-track).
+        track_means: Genome-wide non-zero mean(s) from
+            ``compute_track_mean_from_bigwig``.  Scalar for single-track,
+            numpy array of shape [N] for multi-track.
         total_weight: Weight for Poisson term (default 1.0).
         epsilon: Numerical stability floor.
 
@@ -548,14 +546,10 @@ def cut_and_tag_loss_alphagenome(
         Scalar loss.
     """
     # Extract ATAC signal if predictions is the raw Haiku model output dict
-    # (inside JIT training step, model returns a nested dict; outside (eval), it may
-    # already be a plain array)
     if isinstance(predictions, dict):
         atac_preds = predictions.get('atac', {})
         if 'scaled_predictions_1bp' in atac_preds:
-            pred_signal = atac_preds['scaled_predictions_1bp']  # [batch, seq_len, tracks]
-            if pred_signal.ndim == 3:
-                pred_signal = pred_signal[..., 0]  # take single CUT&Tag track
+            pred_signal = atac_preds['scaled_predictions_1bp']  # [batch, seq_len, N]
         else:
             raise ValueError(
                 f"Cannot find 'scaled_predictions_1bp' in predictions['atac']. "
@@ -563,8 +557,6 @@ def cut_and_tag_loss_alphagenome(
             )
     else:
         pred_signal = predictions
-        if pred_signal.ndim == 3 and pred_signal.shape[-1] == 1:
-            pred_signal = pred_signal[..., 0]
 
     pred_signal = pred_signal.astype(jnp.float32)
     pred_signal = jnp.where(jnp.isfinite(pred_signal), pred_signal, epsilon)
@@ -572,7 +564,7 @@ def cut_and_tag_loss_alphagenome(
     pred_signal = jnp.minimum(pred_signal, 1000.0)
 
     targets_transformed = alphagenome_targets_scaling(
-        targets, track_mean=track_mean, apply_squashing=False
+        targets, track_mean=track_means, apply_squashing=False
     )
 
     loss_per_batch = poisson_multinomial_loss(

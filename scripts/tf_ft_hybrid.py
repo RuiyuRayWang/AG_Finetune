@@ -169,10 +169,16 @@ def generate_genome_windows(
 class CutAndTagDataPipeline:
     """TensorFlow data pipeline for CUT&Tag fine-tuning (BigWig and BedGraph)."""
 
-    def __init__(self, fasta_path, signal_path, windows_bed, window_size,
-                 organism_id, chrom_sizes_path=None):
+    def __init__(self, fasta_path, signal_paths, windows_bed, window_size,
+                 organism_id, chrom_sizes_path=None,
+                 exclude_chroms=None, include_chroms=None):
         self.fasta_extractor = fasta_lib.FastaExtractor(fasta_path)
-        self.signal_extractor = CutAndTagDataPipelineTF(signal_path, chrom_sizes_path)
+        if isinstance(signal_paths, str):
+            signal_paths = [signal_paths]
+        self.signal_extractors = [
+            CutAndTagDataPipelineTF(p, chrom_sizes_path) for p in signal_paths
+        ]
+        self.num_tracks = len(self.signal_extractors)
         self.window_size = window_size
         self.organism_id = organism_id
         self.one_hot_encoder = one_hot_encoder.DNAOneHotEncoder()
@@ -185,7 +191,7 @@ class CutAndTagDataPipeline:
             )
             self.intervals['start'] = self.intervals['start'].astype(int)
             self.intervals['end'] = self.intervals['end'].astype(int)
-            print(f"   ✓ Loaded {len(self.intervals)} training windows")
+            print(f"   ✓ Loaded {len(self.intervals)} windows")
         else:
             if chrom_sizes_path is None:
                 raise ValueError(
@@ -197,6 +203,22 @@ class CutAndTagDataPipeline:
             self.intervals = generate_genome_windows(chrom_sizes_path, window_size)
             print(f"   ✓ Generated {len(self.intervals):,} whole-genome windows "
                   f"({window_size:,} bp, non-overlapping)")
+
+        # Chromosome-based filtering for train/val/test splits
+        if exclude_chroms:
+            before = len(self.intervals)
+            self.intervals = self.intervals[
+                ~self.intervals['chrom'].isin(exclude_chroms)
+            ].reset_index(drop=True)
+            print(f"   Excluded {before - len(self.intervals)} windows on "
+                  f"{exclude_chroms} → {len(self.intervals)} remaining")
+        if include_chroms:
+            before = len(self.intervals)
+            self.intervals = self.intervals[
+                self.intervals['chrom'].isin(include_chroms)
+            ].reset_index(drop=True)
+            print(f"   Kept {len(self.intervals)} windows on {include_chroms} "
+                  f"(dropped {before - len(self.intervals)})")
 
     def get_element(self, idx: int) -> Dict[str, Any]:
         row = self.intervals.iloc[idx]
@@ -213,15 +235,19 @@ class CutAndTagDataPipeline:
         except Exception as e:
             print(f"Warning: sequence {chrom}:{start}-{end}: {e}")
             seq_one_hot = np.zeros((self.window_size, 4), dtype=np.float32)
-        try:
-            signal = self.signal_extractor.get_signal(chrom, start, end)
-            if signal is None or len(signal) != self.window_size:
-                signal = np.zeros(self.window_size, dtype=np.float32)
-            else:
-                signal = np.nan_to_num(signal, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
-        except Exception as e:
-            print(f"Warning: signal {chrom}:{start}-{end}: {e}")
-            signal = np.zeros(self.window_size, dtype=np.float32)
+        signals = []
+        for extractor in self.signal_extractors:
+            try:
+                s = extractor.get_signal(chrom, start, end)
+                if s is None or len(s) != self.window_size:
+                    s = np.zeros(self.window_size, dtype=np.float32)
+                else:
+                    s = np.nan_to_num(s, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+            except Exception as e:
+                print(f"Warning: signal {chrom}:{start}-{end}: {e}")
+                s = np.zeros(self.window_size, dtype=np.float32)
+            signals.append(s)
+        signal = np.stack(signals, axis=-1)  # [window_size, N]
         return {
             'dna_sequence': seq_one_hot,
             'organism_index': self.organism_id,
@@ -232,7 +258,7 @@ class CutAndTagDataPipeline:
         return {
             'dna_sequence': tf.TensorSpec(shape=(self.window_size, 4), dtype=tf.float32),
             'organism_index': tf.TensorSpec(shape=[], dtype=tf.int32),
-            'signal': tf.TensorSpec(shape=(self.window_size,), dtype=tf.float32),
+            'signal': tf.TensorSpec(shape=(self.window_size, self.num_tracks), dtype=tf.float32),
         }
 
     def get_generator(self, shuffle: bool = True, seed: int = 0):
@@ -249,7 +275,8 @@ class CutAndTagDataPipeline:
                     continue
 
     def close(self):
-        self.signal_extractor.close()
+        for extractor in self.signal_extractors:
+            extractor.close()
 
 
 # ---------------------------------------------------------------------------
@@ -409,6 +436,33 @@ class HybridAlphaGenomeModel:
                 out_shardings=(_repl, _repl, _repl),
             )
 
+            # Val step (Phase 1): forward-only, trunk in closure — same
+            # memory pattern as training (trunk NOT passed as JIT arg).
+            self._frozen_val_step_jit = jax.jit(
+                self._frozen_val_step,
+                static_argnames=['loss_fn'],
+                in_shardings=(
+                    _data,  # dna_sequence
+                    _data,  # organism_index
+                    _data,  # targets
+                    _repl,  # head_params
+                ),
+                out_shardings=_repl,
+            )
+
+            # Val step (Phase 2): forward-only, trunk in closure, lora small args.
+            self._lora_val_step_jit = jax.jit(
+                self._lora_val_step,
+                static_argnames=['loss_fn'],
+                in_shardings=(
+                    _data,  # dna_sequence
+                    _data,  # organism_index
+                    _data,  # targets
+                    _repl,  # trainable: {'head', 'lora_A', 'lora_B'}
+                ),
+                out_shardings=_repl,
+            )
+
             # Phase 2: head + lora_A + lora_B gradients
             # trunk_params still in closure
             self._lora_train_step_jit = jax.jit(
@@ -429,6 +483,12 @@ class HybridAlphaGenomeModel:
             )
             self._lora_train_step_jit = jax.jit(
                 self._lora_train_step, static_argnames=['loss_fn']
+            )
+            self._frozen_val_step_jit = jax.jit(
+                self._frozen_val_step, static_argnames=['loss_fn']
+            )
+            self._lora_val_step_jit = jax.jit(
+                self._lora_val_step, static_argnames=['loss_fn']
             )
 
         print(f"✓ HybridAlphaGenomeModel initialized")
@@ -513,7 +573,7 @@ class HybridAlphaGenomeModel:
 
         loss_value, head_grads = jax.value_and_grad(compute_loss)(head_params)
         updates, new_head_opt_state = self._head_optimizer.update(
-            head_grads, head_opt_state
+            head_grads, head_opt_state, head_params
         )
         new_head_params = optax.apply_updates(head_params, updates)
         return loss_value, new_head_params, new_head_opt_state
@@ -570,6 +630,41 @@ class HybridAlphaGenomeModel:
         self.lora_B       = new_trainable['lora_B']
         self._lora_opt_state = new_opt_state
         return loss_value
+
+    # ------------------------------------------------------------------
+    # Validation: forward-only (no gradient)
+    # ------------------------------------------------------------------
+
+    def _frozen_val_step(self, dna_sequence, organism_index, targets, head_params, loss_fn):
+        """Pure forward pass for validation (Phase 1) — trunk in closure, no grad."""
+        trunk_params = self.trunk_params  # closure — same pattern as training
+        full_params = hk.data_structures.merge(trunk_params, head_params)
+        predictions = self.apply_fn(full_params, self.state, dna_sequence, organism_index)
+        return loss_fn(predictions, targets['signal'])
+
+    def _lora_val_step(self, dna_sequence, organism_index, targets, trainable, loss_fn):
+        """Pure forward pass for validation (Phase 2) — trunk in closure, lora applied."""
+        trunk_params = self.trunk_params  # closure — base weights never replicated
+        lora_trunk = self._apply_lora_inline(trunk_params, trainable['lora_A'], trainable['lora_B'])
+        full_params = hk.data_structures.merge(lora_trunk, trainable['head'])
+        predictions = self.apply_fn(full_params, self.state, dna_sequence, organism_index)
+        return loss_fn(predictions, targets['signal'])
+
+    def val_step(self, dna_sequence, organism_index, targets, loss_fn):
+        """Compute validation loss for one batch. Trunk stays in closure."""
+        if self._phase == 'frozen':
+            return self._frozen_val_step_jit(
+                dna_sequence, organism_index, targets, self.head_params, loss_fn
+            )
+        else:
+            trainable = {
+                'head':   self.head_params,
+                'lora_A': self.lora_A,
+                'lora_B': self.lora_B,
+            }
+            return self._lora_val_step_jit(
+                dna_sequence, organism_index, targets, trainable, loss_fn
+            )
 
     # ------------------------------------------------------------------
     # Public API
@@ -727,7 +822,7 @@ class HybridAlphaGenomeModel:
 def train(
     checkpoint_path: str,
     fasta_path: str,
-    signal_path: str,
+    signal_paths,
     output_prefix: str,
     strategy: str = 'head_replace',
     epochs: int = 10,
@@ -747,8 +842,15 @@ def train(
     lora_rank: int = 8,
     lora_alpha: float = 16.0,
     weight_decay: float = 0.04,
+    val_chroms: list = None,
+    test_chroms: list = None,
 ):
     """Fine-tune AlphaGenome with the two-phase hybrid curriculum."""
+
+    if val_chroms is None:
+        val_chroms = []
+    if test_chroms is None:
+        test_chroms = []
 
     # ── Logging setup ───────────────────────────────────────────────────────
     _ts = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
@@ -799,6 +901,16 @@ def train(
 
     lora_phase_epochs = max(0, epochs - freeze_epochs)
 
+    checkpoint_path = os.path.abspath(checkpoint_path)
+    fasta_path      = os.path.abspath(fasta_path)
+    output_dir      = os.path.abspath(output_dir)
+
+    if isinstance(signal_paths, str):
+        signal_paths = [signal_paths]
+    signal_paths  = [os.path.abspath(p) for p in signal_paths]
+    num_tracks    = len(signal_paths)
+    signal_format = 'BigWig' if signal_paths[0].endswith(('.bigwig', '.bw')) else 'BedGraph'
+
     print("=" * 60)
     print(f"FINE-TUNING SETUP  [hybrid curriculum]")
     print("=" * 60)
@@ -807,14 +919,10 @@ def train(
     print(f"Phase 1 (frozen) : {freeze_epochs} epoch(s)  — head only (~0.15 s/step)")
     print(f"Phase 2 (LoRA)   : {lora_phase_epochs} epoch(s)  — head + LoRA "
           f"(rank={lora_rank}, alpha={lora_alpha})")
-
-    checkpoint_path = os.path.abspath(checkpoint_path)
-    fasta_path      = os.path.abspath(fasta_path)
-    signal_path     = os.path.abspath(signal_path)
-    output_dir      = os.path.abspath(output_dir)
-
-    signal_format = "BigWig" if signal_path.endswith(('.bigwig', '.bw')) else "BedGraph"
     print(f"Signal format    : {signal_format}")
+    print(f"Tracks           : {num_tracks}")
+    for p in signal_paths:
+        print(f"   {os.path.basename(p)}")
 
     if genome_windows:
         genome_windows = os.path.abspath(genome_windows)
@@ -824,31 +932,75 @@ def train(
 
     # ── Data pipeline ───────────────────────────────────────────────────────
     print(f"\n1. Setting up TensorFlow data pipeline...")
-    pipeline = CutAndTagDataPipeline(
+
+    # Chromosome-based train/val/test split
+    train_exclude = list(val_chroms) + list(test_chroms)
+    if train_exclude:
+        print(f"   Train split: excluding val chroms {list(val_chroms)} "
+              f"and test chroms {list(test_chroms)}")
+    print(f"   Building training pipeline...")
+    train_pipeline = CutAndTagDataPipeline(
         fasta_path=fasta_path,
-        signal_path=signal_path,
+        signal_paths=signal_paths,
         windows_bed=genome_windows,
         window_size=window_size,
         organism_id=organism_id,
         chrom_sizes_path=chrom_sizes_path,
+        exclude_chroms=train_exclude or None,
     )
-    tf_dataset = (
+    train_tf_dataset = (
         tf.data.Dataset.from_generator(
-            pipeline.get_generator,
-            output_signature=pipeline.get_output_signature(),
+            train_pipeline.get_generator,
+            output_signature=train_pipeline.get_output_signature(),
         )
         .batch(batch_size)
         .prefetch(tf.data.AUTOTUNE)
     )
 
-    num_windows     = len(pipeline.intervals)
-    steps_per_epoch = num_windows // batch_size
+    # Validation pipeline (if val chroms provided)
+    if val_chroms:
+        print(f"   Building validation pipeline ({list(val_chroms)})...")
+        val_pipeline = CutAndTagDataPipeline(
+            fasta_path=fasta_path,
+            signal_paths=signal_paths,
+            windows_bed=genome_windows,
+            window_size=window_size,
+            organism_id=organism_id,
+            chrom_sizes_path=chrom_sizes_path,
+            include_chroms=list(val_chroms),
+        )
+        if len(val_pipeline.intervals) > 0:
+            val_tf_dataset = (
+                tf.data.Dataset.from_generator(
+                    lambda: val_pipeline.get_generator(shuffle=False),
+                    output_signature=val_pipeline.get_output_signature(),
+                )
+                .batch(batch_size)
+                .prefetch(tf.data.AUTOTUNE)
+            )
+            steps_per_val = len(val_pipeline.intervals) // batch_size
+            print(f"   ✓ Val pipeline: {len(val_pipeline.intervals)} windows, "
+                  f"{steps_per_val} steps")
+        else:
+            print(f"   ⚠ No intervals found for val_chroms {list(val_chroms)} — "
+                  f"skipping validation")
+            val_tf_dataset = None
+            steps_per_val = 0
+    else:
+        print(f"   No val_chroms set — validation disabled (best ckpt by train loss)")
+        val_tf_dataset = None
+        steps_per_val = 0
 
-    print(f"   Computing track_mean from BigWig (for AlphaGenome targets_scaling)...")
-    track_mean = compute_track_mean_from_bigwig(
-        signal_path, chrom_sizes_path=chrom_sizes_path
-    )
-    print(f"   track_mean = {track_mean:.6f}  (genome-wide mean of non-zero bp values)")
+    num_train_windows = len(train_pipeline.intervals)
+    steps_per_epoch   = num_train_windows // batch_size
+
+    print(f"   Computing track_means from BigWig(s) (for AlphaGenome targets_scaling)...")
+    track_means_list = []
+    for p in signal_paths:
+        tm = compute_track_mean_from_bigwig(p, chrom_sizes_path=chrom_sizes_path)
+        print(f"   track_mean = {tm:.6f}  ({os.path.basename(p)})")
+        track_means_list.append(tm)
+    track_means = np.array(track_means_list, dtype=np.float32)  # shape [N]
 
     # LR schedules
     freeze_phase_steps  = steps_per_epoch * max(1, freeze_epochs)
@@ -857,7 +1009,7 @@ def train(
     lora_total_steps    = steps_per_epoch * max(1, lora_phase_epochs)
     lora_warmup_steps   = int(0.05 * lora_total_steps)
 
-    print(f"   TF dataset      : {num_windows} windows, {steps_per_epoch} steps/epoch")
+    print(f"   Train windows   : {num_train_windows}, {steps_per_epoch} steps/epoch")
     print(f"   Phase 1 (frozen): {freeze_epochs} epoch(s), "
           f"{freeze_phase_steps} steps, {freeze_warmup_steps} warmup")
     print(f"   Phase 2 (LoRA)  : {lora_phase_epochs} epoch(s), "
@@ -875,17 +1027,20 @@ def train(
     # ── Build the model with a fresh ATAC head ──────────────────────────────
     mesh_ctx = jax.set_mesh(mesh) if mesh is not None else contextlib.nullcontext()
 
-    print(f"\n3. Building new ATAC output head...")
+    print(f"\n3. Building new ATAC output head ({num_tracks} track(s))...")
     organism_enum = (
         dna_model.Organism.HOMO_SAPIENS if organism_id == 0
         else dna_model.Organism.MUS_MUSCULUS
     )
-    track_df = pd.DataFrame([{
-        'output_type': 'ATAC',
-        'name': 'CUT&Tag',
-        'strand': '.',
-        'file_path': signal_path,
-    }])
+    track_df = pd.DataFrame([
+        {
+            'output_type': 'ATAC',
+            'name': os.path.splitext(os.path.basename(p))[0],
+            'strand': '.',
+            'file_path': p,
+        }
+        for p in signal_paths
+    ])
     new_metadata = metadata_lib.AlphaGenomeOutputMetadata(atac=track_df)
     new_output_metadata = {organism_enum: new_metadata}
 
@@ -939,13 +1094,18 @@ def train(
     # ── Training loop ───────────────────────────────────────────────────────
     print(f"\n4. Starting training for {epochs} epochs  "
           f"[freeze_epochs={freeze_epochs}, lora_epochs={lora_phase_epochs}]...")
-    # Bind track_mean into a plain closure — functools.partial is not hashable
-    # and cannot be used with jax.jit static_argnames.
+    # Bind track_means into a plain closure — must be a numpy/JAX array for
+    # multi-track broadcasting in alphagenome_targets_scaling.
     def loss_fn(predictions, targets):
-        return cut_and_tag_loss_alphagenome(predictions, targets, track_mean=track_mean)
+        return cut_and_tag_loss_alphagenome(predictions, targets, track_means=track_means)
     best_loss = float('inf')
 
     with mesh_ctx:
+        # Persistent iterator — created ONCE so data order advances continuously
+        # across epochs (fixes the periodic-valley bug caused by restarting the
+        # generator with seed=0 at every epoch).
+        ds_iter = iter(train_tf_dataset)
+
         for epoch in range(epochs):
             # ── Phase transition ──────────────────────────────────────────
             if epoch == freeze_epochs and model.phase == 'frozen':
@@ -963,7 +1123,6 @@ def train(
             print("-" * 60)
 
             epoch_losses = []
-            ds_iter = tf_dataset.as_numpy_iterator()
 
             for batch_idx, batch in enumerate(
                 itertools.islice(ds_iter, steps_per_epoch)
@@ -1024,18 +1183,40 @@ def train(
                     print(f"  [ckpt] periodic save at step={global_step} "
                           f"(rolling loss={avg:.4f})")
 
+            # ── Validation loop ───────────────────────────────────────────
+            avg_val_loss = None
+            if val_tf_dataset is not None and steps_per_val > 0:
+                val_iter = val_tf_dataset.as_numpy_iterator()
+                val_losses = []
+                for val_batch in itertools.islice(val_iter, steps_per_val):
+                    val_seq = jnp.array(val_batch['dna_sequence'], dtype=jnp.float32)
+                    val_org = jnp.array(val_batch['organism_index'], dtype=jnp.int32)
+                    val_tgt = {'signal': jnp.array(val_batch['signal'], dtype=jnp.float32)}
+                    if data_sharding is not None:
+                        val_seq = jax.device_put(val_seq, data_sharding)
+                        val_org = jax.device_put(val_org, data_sharding)
+                        val_tgt = {'signal': jax.device_put(val_tgt['signal'], data_sharding)}
+                    val_loss = model.val_step(val_seq, val_org, val_tgt, loss_fn)
+                    val_losses.append(float(jax.device_get(val_loss)))
+                avg_val_loss = sum(val_losses) / len(val_losses) if val_losses else float('inf')
+
             # ── Epoch summary ─────────────────────────────────────────────
             if epoch_losses:
                 avg_epoch_loss = sum(epoch_losses) / len(epoch_losses)
                 print(f"\nEpoch {epoch + 1} Summary  [{model.phase}]:")
-                print(f"  Average Loss : {avg_epoch_loss:.6f}")
+                print(f"  Train Loss   : {avg_epoch_loss:.6f}")
+                if avg_val_loss is not None:
+                    print(f"  Val Loss     : {avg_val_loss:.6f}  ({steps_per_val} batches)")
                 print(f"  Batches      : {len(epoch_losses)}")
 
-                if avg_epoch_loss < best_loss:
-                    best_loss = avg_epoch_loss
+                # Best checkpoint: use val loss when available, else train loss
+                score = avg_val_loss if avg_val_loss is not None else avg_epoch_loss
+                if score < best_loss:
+                    best_loss = score
                     best_dir = os.path.join(output_dir, 'best_checkpoint')
                     model.save(best_dir)
-                    print(f"  ✓ Saved best checkpoint (loss={best_loss:.6f}) → {best_dir}")
+                    score_label = 'val_loss' if avg_val_loss is not None else 'train_loss'
+                    print(f"  ✓ Saved best checkpoint ({score_label}={best_loss:.6f}) → {best_dir}")
             else:
                 avg_epoch_loss = float('inf')
                 print(f"\nEpoch {epoch + 1}: ⚠ No batches completed")
@@ -1057,12 +1238,16 @@ def train(
         'checkpoint_path': checkpoint_path,
         'precision_policy': precision_policy,
         'learning_rate':   learning_rate,
+        'weight_decay':    weight_decay,
         'epochs':          epochs,
         'batch_size':      batch_size,
         'window_size':     window_size,
         'best_loss':       best_loss,
         'signal_format':   signal_format,
-        'track_mean':      track_mean,
+        'signal_paths':    signal_paths,
+        'track_means':     track_means.tolist(),
+        'val_chroms':      list(val_chroms),
+        'test_chroms':     list(test_chroms),
     }
     with open(os.path.join(output_dir, 'training_config.json'), 'w') as f:
         json.dump(config_out, f, indent=2)
@@ -1120,7 +1305,6 @@ def main():
 
     checkpoint    = get_value(args.checkpoint,   'checkpoint',    None)
     fasta         = get_value(args.fasta,         'fasta',         None)
-    signal        = get_value(args.signal,        'signal',        None)
     output        = get_value(args.output,        'output',
                               '/home/ray/AG_Finetune/checkpoints/fine_tuned')
     epochs        = get_value(args.epochs,        'epochs',        10)
@@ -1128,6 +1312,8 @@ def main():
     lora_rank     = get_value(args.lora_rank,     'lora_rank',     8)
     lora_alpha    = get_value(args.lora_alpha,    'lora_alpha',    16.0)
     weight_decay  = get_value(None,               'weight_decay',  0.04)
+    val_chroms    = config.get('val_chroms',  [])
+    test_chroms   = config.get('test_chroms', [])
     batch_size    = get_value(args.batch_size,    'batch_size',    8)
     lr            = get_value(args.lr,            'learning_rate', 5e-4)
     window_size   = get_value(args.window_size,   'window_size',   8192)
@@ -1144,17 +1330,32 @@ def main():
         args.checkpoint_interval, 'checkpoint_interval', 20
     )
 
+    # Resolve signal paths: support both 'signal' (string/list) and 'signals' (list)
+    # CLI --signal takes a single path; config 'signals' takes a list.
+    cli_signal = getattr(args, 'signal', None)
+    if cli_signal:
+        signal_paths = [cli_signal]
+    elif 'signals' in config:
+        signal_paths = config['signals']
+        if isinstance(signal_paths, str):
+            signal_paths = [signal_paths]
+    elif 'signal' in config:
+        v = config['signal']
+        signal_paths = v if isinstance(v, list) else [v]
+    else:
+        signal_paths = None
+
     if not checkpoint:
         raise ValueError("--checkpoint is required")
     if not fasta:
         raise ValueError("--fasta is required")
-    if not signal:
-        raise ValueError("--signal is required")
+    if not signal_paths:
+        raise ValueError("--signal or config 'signal'/'signals' is required")
 
     train(
         checkpoint_path=checkpoint,
         fasta_path=fasta,
-        signal_path=signal,
+        signal_paths=signal_paths,
         output_prefix=output,
         epochs=epochs,
         freeze_epochs=freeze_epochs,
@@ -1172,6 +1373,8 @@ def main():
         lora_rank=lora_rank,
         lora_alpha=lora_alpha,
         weight_decay=weight_decay,
+        val_chroms=val_chroms,
+        test_chroms=test_chroms,
     )
 
 

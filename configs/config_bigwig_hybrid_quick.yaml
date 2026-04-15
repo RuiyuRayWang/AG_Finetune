@@ -16,7 +16,12 @@
 # PATHS (Required)
 checkpoint: /home/ray/AG_Finetune/checkpoints/pre_trained/alphagenome-all-folds
 fasta: /home/ray/AG_Finetune/data/resources/mm10.fa
-signal: /home/ray/AG_Finetune/data/CUTTag/ZHY-250227-1/ZHY-250227-1_ACTGCATATAAGGCGA/alignment/bigwig/ZHY-250227-1_ACTGCATATAAGGCGA_bowtie2.chrombpnet_reads_to_bw_unstranded.bw
+
+## Input: Genome track signals in bigwig format.
+# signal: /home/ray/AG_Finetune/data/CUTTag/processed_bigwig/GPe-PV_H3K27ac_averaged_normalized.bigwig  # backwards compatibility
+signals: 
+  - /home/ray/AG_Finetune/data/CUTTag/processed_bigwig/GPe-PV_H3K27ac_averaged_normalized.bigwig
+  - /home/ray/AG_Finetune/data/CUTTag/processed_bigwig/GPe-PV_H3K27me3_averaged_normalized.bigwig
 output: /home/ray/AG_Finetune/checkpoints/fine_tuned
 
 ## Required when windows_bed is omitted (whole-genome mode)
@@ -31,21 +36,32 @@ precision_policy: params=float32,compute=float32,output=float32
 epochs: 3
 freeze_epochs: 1        # Phase 1: 1 epoch head-only (~6.5 min)
                         # Phase 2: 2 epochs head+LoRA (~38 min)
-batch_size: 8
-learning_rate: 5e-4
-checkpoint_interval: 0
+batch_size: 4
+learning_rate: 5e-4     # Peak LR used in both phases
+weight_decay: 0.04      # AdamW weight decay (paper pre-training: 0.4, distillation: 0.04)
+checkpoint_interval: 0    # Mid-epoch crash-recovery saves. Disabled: no resume logic exists, so these are never used.
 
 
 # LORA CONFIGURATION (Phase 2)
-lora_rank: 8
-lora_alpha: 16.0
+lora_rank: 16
+lora_alpha: 32.0
 
 
 # DATA & AUGMENTATION
-window_size: 131072     # 2^17 bp
+window_size: 8192       # 2^13 bp — covers AAV genome (~4.7 kb) with ~1.75 kb flanking on each side
 organism_id: 1          # mouse
 augment: true
-max_shift: 1024
+max_shift: 256
+
+
+# CHROMOSOME SPLITS (mm10)
+# Chromosomes held out for validation (used for early stopping / best checkpoint selection)
+val_chroms:
+  - chr7
+# Chromosomes held out for testing (never seen during training — for final evaluation only)
+test_chroms:
+  - chr8
+  - chr9
 
 
 # SYSTEM

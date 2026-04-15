@@ -279,7 +279,7 @@ The blockquoted (>) contents are excerptions from the supplementary methods of t
 > Processed genomic tracks, serving as model prediction targets, were converted to brain floating point (bfloat16) format for numerical efficiency and stored in z-standard compressed sharded matrices. Most data tracks were maintained at base-pair resolution, except for ChIPseq (TF and Histone) tracks, which represent fold-change values, and were stored as base-resolution cumulative sums. This strategy allows for efficient querying of their average signal at 128 bp resolution.
 > The model directly uses the track values resulting from the upstream processing steps, which typically represent normalized read or insertion counts (often scaled to a total of 100 million signals per track for sequencing assays) or fold-change enrichments (for ChIP-seq). No additional scaling transformations (e.g., log-scaling or z-score normalization across tracks) are applied before model input. Predicted splice junction counts are an exception; while their values are additionally scaled (as described in the training methods), this does not affect their primary use in calculating ratios for relative splice site assessment.
 
-*We implemented the normalization and aggregation in a stand alone script (`scripts/process_cutandtag_bedgraphs.py`)*
+*We implemented the normalization and aggregation in a standalone script (`scripts/average_normalize_bigwigs.py`)*
 *Note that we should NOT do scaling transformation to the final data.*
 
 > ## Model
