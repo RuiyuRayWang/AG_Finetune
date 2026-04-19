@@ -1,28 +1,36 @@
-# AlphaGenome Fine-tuning Configuration — Hybrid Head+LoRA, Quick 3-epoch run
+# AlphaGenome Fine-tuning Configuration — Hybrid Head+LoRA Curriculum
 #
-# Identical to config_bigwig_hybrid.yaml except:
-#   epochs: 3  (1 freeze + 2 LoRA)
-#   Expected wall time: ~45 min
+# Two-phase training strategy implemented in tf_ft_hybrid.py:
 #
-# Checkpoints are saved with jax.device_get() → plain numpy, no NamedSharding.
-# Load with CUDA_VISIBLE_DEVICES=0 in the evaluation notebook (no LD_PRELOAD
-# needed, no NCCL, single-GPU inference).
+#   Phase 1  (first `freeze_epochs` epochs)  — Head only
+#     Trunk is fully frozen.  Only the new ATAC head (~9 K params) is
+#     optimised.  Per-step time: ~0.15 s.  Loss converges quickly.
+#
+#   Phase 2  (remaining epochs)  — Head + LoRA
+#     Trunk base weights stay frozen.  Low-rank A/B matrices are added to
+#     the Q/K/V projections of all 9 transformer blocks (~428 K params at
+#     rank 8) and trained jointly with the head.  Trunk is never mutated
+#     directly — LoRA deltas are merged only at save/inference time.
+#     Per-step time is intermediate; far fewer params than full training.
 #
 # Usage:
 #   LD_PRELOAD=/home/ray/miniforge3/envs/alphagenome/lib/python3.11/site-packages/nvidia/nccl/lib/libnccl.so.2 \
-#       python scripts/tf_ft_hybrid.py --config configs/config_bigwig_hybrid_quick.yaml
+#       python scripts/tf_ft_hybrid.py --config configs/config_bigwig_hybrid.yaml
 
 
 # PATHS (Required)
 checkpoint: /home/ray/AG_Finetune/checkpoints/pre_trained/alphagenome-all-folds
 fasta: /home/ray/AG_Finetune/data/resources/mm10.fa
-
-## Input: Genome track signals in bigwig format.
-# signal: /home/ray/AG_Finetune/data/CUTTag/processed_bigwig/GPe-PV_H3K27ac_averaged_normalized.bigwig  # backwards compatibility
 signals: 
   - /home/ray/AG_Finetune/data/CUTTag/processed_bigwig/GPe-PV_H3K27ac_averaged_normalized.bigwig
   - /home/ray/AG_Finetune/data/CUTTag/processed_bigwig/GPe-PV_H3K27me3_averaged_normalized.bigwig
+  
 output: /home/ray/AG_Finetune/checkpoints/fine_tuned
+
+## Optional: BED file with specific genomic windows to use for training
+## If not provided, non-overlapping windows are generated from chrom_sizes (whole-genome mode)
+windows_bed:
+# windows_bed: /home/ray/AG_Finetune/exports/peak_safe_windows/D1MSN_H3K27ac_merged_peak_safe_windows.bed  # Disabled
 
 ## Required when windows_bed is omitted (whole-genome mode)
 chrom_sizes: /home/ray/AG_Finetune/data/resources/mm10.chrom.sizes
@@ -34,24 +42,25 @@ precision_policy: params=float32,compute=float32,output=float32
 
 # TRAINING HYPERPARAMETERS
 epochs: 3
-freeze_epochs: 1        # Phase 1: 1 epoch head-only (~6.5 min)
-                        # Phase 2: 2 epochs head+LoRA (~38 min)
+freeze_epochs: 1        # Phase 1 length: epochs to keep trunk fully frozen
 batch_size: 4
-learning_rate: 5e-4     # Peak LR used in both phases
+learning_rate: 3e-4     # Peak LR used in both phases
 weight_decay: 0.04      # AdamW weight decay (paper pre-training: 0.4, distillation: 0.04)
-checkpoint_interval: 0    # Mid-epoch crash-recovery saves. Disabled: no resume logic exists, so these are never used.
+checkpoint_epoch_interval: 0  # Save epoch_NNN every N epochs (0 disables epoch snapshots; best checkpoint still saved).
 
 
 # LORA CONFIGURATION (Phase 2)
-lora_rank: 16
-lora_alpha: 32.0
+lora_rank: 32           # LoRA rank — increase to 32/64 if Phase 2 plateaus early
+lora_alpha: 64.0        # LoRA alpha scaling factor (effective LR = alpha/rank = 2.0)
+lora_init_std: 0.02     # Init std for both A and B matrices (symmetric N(0, 0.02) init)
 
 
 # DATA & AUGMENTATION
-window_size: 8192       # 2^13 bp — covers AAV genome (~4.7 kb) with ~1.75 kb flanking on each side
-organism_id: 1          # mouse
+# window_size: 8192       # 2^13 bp — covers AAV genome (~4.7 kb) with ~1.75 kb flanking on each side
+window_size: 65536       # 2^16 bp — covers AAV genome (~4.7 kb) with ~31.25 kb flanking on each side
+organism_id: 1          # 0=human, 1=mouse
 augment: true
-max_shift: 256
+max_shift: 1024
 
 
 # CHROMOSOME SPLITS (mm10)

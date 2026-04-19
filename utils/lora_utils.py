@@ -18,7 +18,8 @@ def initialize_lora_params(
     target_layers: List[str],
     rank: int = 8,
     alpha: float = 16.0,
-    seed: int = 42
+    seed: int = 42,
+    init_std: float = None,
 ) -> Dict:
     """
     Initialize LoRA parameters for specified layers.
@@ -32,6 +33,11 @@ def initialize_lora_params(
         rank: LoRA rank (default 8)
         alpha: LoRA scaling factor (default 16)
         seed: Random seed for initialization
+        init_std: If set, initialize both A and B as N(0, init_std).
+            This gives a small non-zero ΔW = B @ A from the start, which can
+            improve gradient flow at higher ranks.  If None (default), uses the
+            standard asymmetric init: A ~ Kaiming-normal, B = 0 (ΔW starts
+            exactly at zero, preserving the pretrained checkpoint).
         
     Returns:
         Dictionary containing LoRA parameters with structure:
@@ -62,12 +68,18 @@ def initialize_lora_params(
         
         d_in, d_out = weight_shape
         
-        # Initialize A with random values (Kaiming uniform)
-        rng, key_a = jax.random.split(rng)
-        lora_A[layer_path] = jax.random.normal(key_a, (d_in, rank)) * jnp.sqrt(1.0 / d_in)
-        
-        # Initialize B with zeros (so LoRA starts as identity)
-        lora_B[layer_path] = jnp.zeros((rank, d_out))
+        rng, key_a, key_b = jax.random.split(rng, 3)
+        if init_std is not None:
+            # Symmetric small-normal init: both A and B ~ N(0, init_std).
+            # ΔW = B @ A * scaling starts as small random noise rather than
+            # exactly zero, which can help gradient flow at higher ranks.
+            lora_A[layer_path] = jax.random.normal(key_a, (d_in, rank)) * init_std
+            lora_B[layer_path] = jax.random.normal(key_b, (rank, d_out)) * init_std
+        else:
+            # Standard asymmetric init: A ~ Kaiming-normal, B = 0.
+            # Guarantees ΔW = 0 at step 0 — model is identical to pretrained.
+            lora_A[layer_path] = jax.random.normal(key_a, (d_in, rank)) * jnp.sqrt(1.0 / d_in)
+            lora_B[layer_path] = jnp.zeros((rank, d_out))
     
     return {
         'lora_A': lora_A,

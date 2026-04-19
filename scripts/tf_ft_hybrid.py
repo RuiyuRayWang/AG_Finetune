@@ -310,6 +310,7 @@ class HybridAlphaGenomeModel:
         weight_decay: float = 0.04,
         lora_rank: int = 8,
         lora_alpha: float = 16.0,
+        lora_init_std: float = None,
         warmup_steps: int = 0,
         total_steps: int = 0,
         freeze_warmup_steps: int = 0,
@@ -326,6 +327,9 @@ class HybridAlphaGenomeModel:
                                  distillation: 0.04; default 0.04 for fine-tuning).
             lora_rank:           LoRA rank for Phase 2 (default 8).
             lora_alpha:          LoRA alpha scaling for Phase 2 (default 16.0).
+            lora_init_std:       If set, initialize both LoRA A and B matrices as
+                                 N(0, lora_init_std).  If None (default), uses the
+                                 standard asymmetric init (Kaiming A, zeros B).
             warmup_steps:        Warmup steps for Phase 2 cosine schedule.
             total_steps:         Total steps for Phase 2 cosine schedule.
             freeze_warmup_steps: Warmup steps for Phase 1 cosine schedule.
@@ -365,6 +369,7 @@ class HybridAlphaGenomeModel:
             target_layers=target_layers,
             rank=lora_rank,
             alpha=lora_alpha,
+            init_std=lora_init_std,
         )
         # Trainable arrays — separated from static metadata
         self.lora_A      = lora_init['lora_A']        # dict[str, array]
@@ -433,7 +438,8 @@ class HybridAlphaGenomeModel:
                     _repl,  # head_params
                     _repl,  # head_opt_state
                 ),
-                out_shardings=(_repl, _repl, _repl),
+                # loss_value, per_track_losses, new_head_params, new_head_opt_state
+                out_shardings=(_repl, _repl, _repl, _repl),
             )
 
             # Val step (Phase 1): forward-only, trunk in closure — same
@@ -447,7 +453,7 @@ class HybridAlphaGenomeModel:
                     _data,  # targets
                     _repl,  # head_params
                 ),
-                out_shardings=_repl,
+                out_shardings=(_repl, _repl),  # total_loss, per_track_losses
             )
 
             # Val step (Phase 2): forward-only, trunk in closure, lora small args.
@@ -460,7 +466,7 @@ class HybridAlphaGenomeModel:
                     _data,  # targets
                     _repl,  # trainable: {'head', 'lora_A', 'lora_B'}
                 ),
-                out_shardings=_repl,
+                out_shardings=(_repl, _repl),  # total_loss, per_track_losses
             )
 
             # Phase 2: head + lora_A + lora_B gradients
@@ -475,7 +481,8 @@ class HybridAlphaGenomeModel:
                     _repl,  # trainable: {'head', 'lora_A', 'lora_B'}
                     _repl,  # opt_state
                 ),
-                out_shardings=(_repl, _repl, _repl),
+                # loss_value, per_track_losses, new_trainable, new_opt_state
+                out_shardings=(_repl, _repl, _repl, _repl),
             )
         else:
             self._frozen_train_step_jit = jax.jit(
@@ -571,21 +578,27 @@ class HybridAlphaGenomeModel:
             )
             return loss_fn(predictions, targets['signal'])
 
-        loss_value, head_grads = jax.value_and_grad(compute_loss)(head_params)
+        # loss_fn returns (total_loss, per_track_losses); has_aux=True treats
+        # the second element as auxiliary data not differentiated through.
+        (loss_value, per_track_losses), head_grads = jax.value_and_grad(
+            compute_loss, has_aux=True
+        )(head_params)
         updates, new_head_opt_state = self._head_optimizer.update(
             head_grads, head_opt_state, head_params
         )
         new_head_params = optax.apply_updates(head_params, updates)
-        return loss_value, new_head_params, new_head_opt_state
+        return loss_value, per_track_losses, new_head_params, new_head_opt_state
 
     def _frozen_train_wrapper(self, dna_sequence, organism_index, targets, loss_fn):
-        loss_value, new_head_params, new_head_opt_state = self._frozen_train_step_jit(
-            dna_sequence, organism_index, targets,
-            self.head_params, self._head_opt_state, loss_fn,
+        loss_value, per_track_losses, new_head_params, new_head_opt_state = (
+            self._frozen_train_step_jit(
+                dna_sequence, organism_index, targets,
+                self.head_params, self._head_opt_state, loss_fn,
+            )
         )
         self.head_params = new_head_params
         self._head_opt_state = new_head_opt_state
-        return loss_value
+        return loss_value, per_track_losses
 
     # ------------------------------------------------------------------
     # Phase 2: head + LoRA, trunk base stays frozen
@@ -610,10 +623,12 @@ class HybridAlphaGenomeModel:
             )
             return loss_fn(predictions, targets['signal'])
 
-        loss_value, grads = jax.value_and_grad(compute_loss)(trainable)
+        (loss_value, per_track_losses), grads = jax.value_and_grad(
+            compute_loss, has_aux=True
+        )(trainable)
         updates, new_opt_state = self._lora_optimizer.update(grads, opt_state, trainable)
         new_trainable = optax.apply_updates(trainable, updates)
-        return loss_value, new_trainable, new_opt_state
+        return loss_value, per_track_losses, new_trainable, new_opt_state
 
     def _lora_train_wrapper(self, dna_sequence, organism_index, targets, loss_fn):
         trainable = {
@@ -621,15 +636,17 @@ class HybridAlphaGenomeModel:
             'lora_A': self.lora_A,
             'lora_B': self.lora_B,
         }
-        loss_value, new_trainable, new_opt_state = self._lora_train_step_jit(
-            dna_sequence, organism_index, targets,
-            trainable, self._lora_opt_state, loss_fn,
+        loss_value, per_track_losses, new_trainable, new_opt_state = (
+            self._lora_train_step_jit(
+                dna_sequence, organism_index, targets,
+                trainable, self._lora_opt_state, loss_fn,
+            )
         )
         self.head_params  = new_trainable['head']
         self.lora_A       = new_trainable['lora_A']
         self.lora_B       = new_trainable['lora_B']
         self._lora_opt_state = new_opt_state
-        return loss_value
+        return loss_value, per_track_losses
 
     # ------------------------------------------------------------------
     # Validation: forward-only (no gradient)
@@ -651,7 +668,11 @@ class HybridAlphaGenomeModel:
         return loss_fn(predictions, targets['signal'])
 
     def val_step(self, dna_sequence, organism_index, targets, loss_fn):
-        """Compute validation loss for one batch. Trunk stays in closure."""
+        """Compute validation loss for one batch. Trunk stays in closure.
+
+        Returns:
+            (total_loss, per_track_losses) — mirrors train_step return signature.
+        """
         if self._phase == 'frozen':
             return self._frozen_val_step_jit(
                 dna_sequence, organism_index, targets, self.head_params, loss_fn
@@ -708,16 +729,21 @@ class HybridAlphaGenomeModel:
         targets: Dict,
         loss_fn: Callable,
     ):
-        """Unified interface: dispatches to frozen or LoRA step automatically."""
+        """Unified interface: dispatches to frozen or LoRA step automatically.
+
+        Returns:
+            (loss_value, per_track_losses) — loss_value is a scalar; 
+            per_track_losses is a JAX array of shape [N] (one entry per track).
+        """
         if self._phase == 'frozen':
-            loss_value = self._frozen_train_wrapper(
+            loss_value, per_track_losses = self._frozen_train_wrapper(
                 dna_sequence, organism_index, targets, loss_fn
             )
         else:
-            loss_value = self._lora_train_wrapper(
+            loss_value, per_track_losses = self._lora_train_wrapper(
                 dna_sequence, organism_index, targets, loss_fn
             )
-        return loss_value, jnp.float32(0.0)
+        return loss_value, per_track_losses
 
     def save(self, dirpath: str):
         """
@@ -797,6 +823,17 @@ class HybridAlphaGenomeModel:
             lambda module_name, *_: 'head' not in module_name, all_params
         )
 
+        # Restore phase from lora_metadata.json (written by save())
+        meta_path = os.path.join(dirpath, 'lora_metadata.json')
+        if os.path.exists(meta_path):
+            with open(meta_path) as f:
+                meta = json.load(f)
+            saved_phase = meta.get('phase', 'frozen')
+            if saved_phase == 'lora' and self._phase != 'lora':
+                # Re-activate LoRA so that lora_A/B matrices are initialised
+                # before we overwrite them from the checkpoint below.
+                self.activate_lora()
+
         # Restore raw LoRA arrays if Phase 2 checkpoint exists
         lora_raw_dir = os.path.join(dirpath, 'lora_raw')
         if os.path.exists(lora_raw_dir):
@@ -838,14 +875,23 @@ def train(
     precision_policy: str = 'params=float32,compute=float32,output=float32',
     config_path: str = None,
     chrom_sizes_path: str = None,
-    checkpoint_interval: int = 20,
+    checkpoint_epoch_interval: int = 1,
     lora_rank: int = 8,
     lora_alpha: float = 16.0,
+    lora_init_std: float = None,
     weight_decay: float = 0.04,
     val_chroms: list = None,
     test_chroms: list = None,
+    resume_checkpoint_dir: str = None,
+    resume_start_epoch: int = 0,
 ):
-    """Fine-tune AlphaGenome with the two-phase hybrid curriculum."""
+    """Fine-tune AlphaGenome with the two-phase hybrid curriculum.
+
+    Args:
+        checkpoint_epoch_interval: Epoch-level checkpoint save interval.
+            Saves ``epoch_NNN/`` when ``epoch % checkpoint_epoch_interval == 0``.
+            Set to 0 to disable epoch checkpoints (best checkpoint is still saved).
+    """
 
     if val_chroms is None:
         val_chroms = []
@@ -869,10 +915,7 @@ def train(
 
     _metrics_file   = open(metrics_path, 'a', newline='', buffering=1)
     _metrics_writer = csv.writer(_metrics_file)
-    if os.path.getsize(metrics_path) == 0:
-        _metrics_writer.writerow(
-            ['timestamp', 'epoch', 'batch', 'loss', 'phase', 'nan_event', 'skipped']
-        )
+    # Header is written after num_tracks is resolved (see below).
 
     _stderr_log_path = os.path.join(output_dir, 'stderr.log')
     _stderr_log_fd   = os.open(_stderr_log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
@@ -911,6 +954,14 @@ def train(
     num_tracks    = len(signal_paths)
     signal_format = 'BigWig' if signal_paths[0].endswith(('.bigwig', '.bw')) else 'BedGraph'
 
+    # Write metrics CSV header now that num_tracks is known.
+    if os.path.getsize(metrics_path) == 0:
+        per_track_cols = [f'track_{i}_loss' for i in range(num_tracks)]
+        _metrics_writer.writerow(
+            ['timestamp', 'epoch', 'batch', 'loss', 'phase', 'nan_event', 'skipped']
+            + per_track_cols
+        )
+
     print("=" * 60)
     print(f"FINE-TUNING SETUP  [hybrid curriculum]")
     print("=" * 60)
@@ -919,6 +970,8 @@ def train(
     print(f"Phase 1 (frozen) : {freeze_epochs} epoch(s)  — head only (~0.15 s/step)")
     print(f"Phase 2 (LoRA)   : {lora_phase_epochs} epoch(s)  — head + LoRA "
           f"(rank={lora_rank}, alpha={lora_alpha})")
+    print(f"Ckpt epoch intvl : {checkpoint_epoch_interval} "
+          f"(0=disabled, saves epoch_NNN every N epochs)")
     print(f"Signal format    : {signal_format}")
     print(f"Tracks           : {num_tracks}")
     for p in signal_paths:
@@ -1017,9 +1070,26 @@ def train(
 
     # ── Load base model ─────────────────────────────────────────────────────
     print(f"\n2. Loading base model from {checkpoint_path}...")
+    # Important: do not use default_organism_settings() here, because it points
+    # to remote GTF/PAS/splice Feather files and can block on network I/O.
+    # Training only needs params/state + local FASTA; annotation files are not
+    # required for the fine-tuning loop.
+    train_organism = (
+        dna_model.Organism.HOMO_SAPIENS if organism_id == 0
+        else dna_model.Organism.MUS_MUSCULUS
+    )
     base_model = dna_model.create(
         checkpoint_path=checkpoint_path,
-        organism_settings=None,
+        organism_settings={
+            train_organism: dna_model.OrganismSettings(
+                metadata=None,
+                fasta_path=fasta_path,
+                gtf_feather_path=None,
+                pas_feather_path=None,
+                splice_site_starts_feather_path=None,
+                splice_site_ends_feather_path=None,
+            )
+        },
         device=None,
     )
     print(f"   ✓ Model loaded on {base_model._device_context._device}")
@@ -1085,11 +1155,19 @@ def train(
         weight_decay=weight_decay,
         lora_rank=lora_rank,
         lora_alpha=lora_alpha,
+        lora_init_std=lora_init_std,
         warmup_steps=lora_warmup_steps,
         total_steps=lora_total_steps,
         freeze_warmup_steps=freeze_warmup_steps,
         freeze_total_steps=freeze_phase_steps,
     )
+
+    # ── Resume from checkpoint if requested ────────────────────────────────
+    if resume_checkpoint_dir:
+        print(f"\n   [resume] Loading checkpoint from: {resume_checkpoint_dir}")
+        model.load(resume_checkpoint_dir)
+        print(f"   [resume] ✓ Restored params/state/LoRA  "
+              f"(phase={model.phase}, start_epoch={resume_start_epoch + 1})")
 
     # ── Training loop ───────────────────────────────────────────────────────
     print(f"\n4. Starting training for {epochs} epochs  "
@@ -1106,7 +1184,7 @@ def train(
         # generator with seed=0 at every epoch).
         ds_iter = iter(train_tf_dataset)
 
-        for epoch in range(epochs):
+        for epoch in range(resume_start_epoch, epochs):
             # ── Phase transition ──────────────────────────────────────────
             if epoch == freeze_epochs and model.phase == 'frozen':
                 print(f"\n{'=' * 60}")
@@ -1141,16 +1219,20 @@ def train(
                     organism_ids = jax.device_put(organism_ids, data_sharding)
                     targets = {'signal': jax.device_put(targets['signal'], data_sharding)}
 
-                loss_value, _ = model.train_step(
+                loss_value, per_track_losses = model.train_step(
                     sequences, organism_ids, targets, loss_fn
                 )
                 loss_host = float(jax.device_get(loss_value))
+                per_track_host = np.asarray(
+                    jax.device_get(per_track_losses)
+                ).flatten().tolist()
                 epoch_losses.append(loss_host)
 
                 _metrics_writer.writerow([
                     datetime.datetime.now().isoformat(),
                     epoch + 1, batch_idx + 1,
                     loss_host, model.phase, False, False,
+                    *per_track_host,
                 ])
 
                 if batch_idx == 0:
@@ -1170,18 +1252,13 @@ def train(
                     avg = sum(epoch_losses[-print_interval:]) / min(
                         print_interval, len(epoch_losses)
                     )
-                    print(f"  Batch {batch_idx + 1}/{steps_per_epoch}: Loss = {avg:.6f}")
-
-                # Mid-epoch periodic checkpoint — crash-recovery only.
-                # Does NOT update best_loss; best checkpoint is determined
-                # solely by the full-epoch mean at epoch end.
-                if checkpoint_interval > 0 and (batch_idx + 1) % checkpoint_interval == 0:
-                    global_step = epoch * steps_per_epoch + batch_idx + 1
-                    periodic_dir = os.path.join(
-                        output_dir, f'epoch_{epoch + 1:03d}_step_{global_step:06d}')
-                    model.save(periodic_dir)
-                    print(f"  [ckpt] periodic save at step={global_step} "
-                          f"(rolling loss={avg:.4f})")
+                    track_str = '  '.join(
+                        f'track[{i}]={v:.6f}' for i, v in enumerate(per_track_host)
+                    )
+                    print(
+                        f"  Batch {batch_idx + 1}/{steps_per_epoch}: "
+                        f"Loss = {avg:.6f}  [{track_str}]"
+                    )
 
             # ── Validation loop ───────────────────────────────────────────
             avg_val_loss = None
@@ -1196,7 +1273,9 @@ def train(
                         val_seq = jax.device_put(val_seq, data_sharding)
                         val_org = jax.device_put(val_org, data_sharding)
                         val_tgt = {'signal': jax.device_put(val_tgt['signal'], data_sharding)}
-                    val_loss = model.val_step(val_seq, val_org, val_tgt, loss_fn)
+                    val_loss, _val_per_track = model.val_step(
+                        val_seq, val_org, val_tgt, loss_fn
+                    )
                     val_losses.append(float(jax.device_get(val_loss)))
                 avg_val_loss = sum(val_losses) / len(val_losses) if val_losses else float('inf')
 
@@ -1221,8 +1300,13 @@ def train(
                 avg_epoch_loss = float('inf')
                 print(f"\nEpoch {epoch + 1}: ⚠ No batches completed")
 
-            epoch_dir = os.path.join(output_dir, f'epoch_{epoch + 1:03d}')
-            model.save(epoch_dir)
+            # Epoch-level checkpoint saves (configurable interval).
+            if checkpoint_epoch_interval > 0:
+                should_save_epoch_ckpt = ((epoch + 1) % checkpoint_epoch_interval == 0)
+                if should_save_epoch_ckpt:
+                    epoch_dir = os.path.join(output_dir, f'epoch_{epoch + 1:03d}')
+                    model.save(epoch_dir)
+                    print(f"  [ckpt] epoch save → {epoch_dir}")
 
     print("\n" + "=" * 60)
     print("TRAINING COMPLETE!")
@@ -1235,11 +1319,13 @@ def train(
         'freeze_epochs':   freeze_epochs,
         'lora_rank':       lora_rank,
         'lora_alpha':      lora_alpha,
+        'lora_init_std':   lora_init_std,
         'checkpoint_path': checkpoint_path,
         'precision_policy': precision_policy,
         'learning_rate':   learning_rate,
         'weight_decay':    weight_decay,
         'epochs':          epochs,
+        'checkpoint_epoch_interval': checkpoint_epoch_interval,
         'batch_size':      batch_size,
         'window_size':     window_size,
         'best_loss':       best_loss,
@@ -1248,6 +1334,8 @@ def train(
         'track_means':     track_means.tolist(),
         'val_chroms':      list(val_chroms),
         'test_chroms':     list(test_chroms),
+        'resumed_from':    resume_checkpoint_dir,
+        'resumed_from_epoch': resume_start_epoch,
     }
     with open(os.path.join(output_dir, 'training_config.json'), 'w') as f:
         json.dump(config_out, f, indent=2)
@@ -1257,6 +1345,54 @@ def train(
     os.close(_saved_stderr_fd)
     _sys.stdout = _tee._stream
     _tee.close()
+
+
+# ---------------------------------------------------------------------------
+# Resume helpers
+# ---------------------------------------------------------------------------
+
+def _resolve_resume_checkpoint(resume_from: str):
+    """Resolve a resume-from path to (checkpoint_dir, start_epoch).
+
+    Accepts:
+    - An explicit ``epoch_NNN/`` directory  → start_epoch = NNN
+    - A run directory (contains epoch_NNN/ sub-dirs) → uses highest epoch sub-dir
+    - ``best_checkpoint`` directory inside a run dir
+    """
+    import re as _re
+
+    if not os.path.isdir(resume_from):
+        raise FileNotFoundError(f"--resume-from path not found: {resume_from}")
+
+    # Direct epoch_NNN directory?
+    m = _re.search(r'epoch_(\d+)$', resume_from)
+    if m and os.path.isdir(os.path.join(resume_from, 'model')):
+        return os.path.abspath(resume_from), int(m.group(1))
+
+    # best_checkpoint inside run dir?
+    best = os.path.join(resume_from, 'best_checkpoint')
+    if os.path.isdir(os.path.join(best, 'model')):
+        import glob as _glob
+        start_epoch = 0
+        epoch_dirs = sorted(_glob.glob(os.path.join(resume_from, 'epoch_*')))
+        if epoch_dirs:
+            m2 = _re.search(r'epoch_(\d+)$', epoch_dirs[-1])
+            if m2:
+                start_epoch = int(m2.group(1))
+        return os.path.abspath(best), start_epoch
+
+    # Run directory: find highest epoch_NNN/
+    import glob as _glob
+    epoch_dirs = sorted(_glob.glob(os.path.join(resume_from, 'epoch_*')))
+    valid = [d for d in epoch_dirs if os.path.isdir(os.path.join(d, 'model'))]
+    if not valid:
+        raise FileNotFoundError(
+            f"No valid epoch_NNN checkpoint found in: {resume_from}"
+        )
+    last = valid[-1]
+    m3 = _re.search(r'epoch_(\d+)$', last)
+    start_epoch = int(m3.group(1)) if m3 else 0
+    return os.path.abspath(last), start_epoch
 
 
 # ---------------------------------------------------------------------------
@@ -1287,7 +1423,12 @@ def main():
     parser.add_argument('--chrom-sizes', type=str, default=None)
     parser.add_argument('--no-augment', action='store_true')
     parser.add_argument('--max-shift', type=int, default=None)
-    parser.add_argument('--checkpoint-interval', type=int, default=None)
+    parser.add_argument('--checkpoint-epoch-interval', type=int, default=None,
+                        help='Save epoch_NNN checkpoint every N epochs (0 disables).')
+    parser.add_argument('--resume-from', type=str, default=None,
+                        help='Resume training from a previous run directory or '
+                             'epoch_NNN checkpoint. Training continues from the '
+                             'next epoch after the resolved checkpoint.')
 
     args = parser.parse_args()
 
@@ -1303,6 +1444,15 @@ def main():
             return cli_arg
         return config.get(config_key, default)
 
+    # ── Resume-from resolution ───────────────────────────────────────────────
+    resume_checkpoint_dir = None
+    resume_start_epoch    = 0
+    if args.resume_from:
+        resume_checkpoint_dir, resume_start_epoch = _resolve_resume_checkpoint(args.resume_from)
+        print(f"[resume] Resolved checkpoint : {resume_checkpoint_dir}")
+        print(f"[resume] Resuming from epoch : {resume_start_epoch + 1}")
+    # ────────────────────────────────────────────────────────────────────────
+
     checkpoint    = get_value(args.checkpoint,   'checkpoint',    None)
     fasta         = get_value(args.fasta,         'fasta',         None)
     output        = get_value(args.output,        'output',
@@ -1311,6 +1461,7 @@ def main():
     freeze_epochs = get_value(args.freeze_epochs, 'freeze_epochs', 2)
     lora_rank     = get_value(args.lora_rank,     'lora_rank',     8)
     lora_alpha    = get_value(args.lora_alpha,    'lora_alpha',    16.0)
+    lora_init_std = get_value(None,               'lora_init_std', None)
     weight_decay  = get_value(None,               'weight_decay',  0.04)
     val_chroms    = config.get('val_chroms',  [])
     test_chroms   = config.get('test_chroms', [])
@@ -1326,8 +1477,8 @@ def main():
         'params=float32,compute=float32,output=float32'
     )
     augment = False if args.no_augment else config.get('augment', True)
-    checkpoint_interval = get_value(
-        args.checkpoint_interval, 'checkpoint_interval', 20
+    checkpoint_epoch_interval = get_value(
+        args.checkpoint_epoch_interval, 'checkpoint_epoch_interval', 1
     )
 
     # Resolve signal paths: support both 'signal' (string/list) and 'signals' (list)
@@ -1369,12 +1520,15 @@ def main():
         precision_policy=precision_policy,
         config_path=args.config,
         chrom_sizes_path=chrom_sizes,
-        checkpoint_interval=checkpoint_interval,
+        checkpoint_epoch_interval=checkpoint_epoch_interval,
         lora_rank=lora_rank,
         lora_alpha=lora_alpha,
+        lora_init_std=lora_init_std,
         weight_decay=weight_decay,
         val_chroms=val_chroms,
         test_chroms=test_chroms,
+        resume_checkpoint_dir=resume_checkpoint_dir,
+        resume_start_epoch=resume_start_epoch,
     )
 
 

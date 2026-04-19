@@ -532,9 +532,26 @@ def multinomial_loss(
 
 > The distillation process ran for 250,000 steps, taking approximately 3 days. We used the AdamW optimizer with default parameters and a reduced weight decay coefficient of 0.04 compared to pre-training. The learning rate schedule consisted of three phases: a linear ramp-up to 0.002 over the initial 5,000 steps, a constant phase at 0.002 for the next 120,000 steps, and finally a cosine decay down to 0 over the concluding 125,000 steps.
 
+> ### Variant evaluations
+
+> #### In Silico Mutagenesis (ISM) for Contribution Scores
+
+> To interpret which nucleotides in a sequence of interest contribute most to AlphaGenome’s predictions for a specific genomic feature, we employed an in silico mutagenesis (ISM) approach. This method estimates a contribution score for each position in the sequence.
+
+> The procedure is as follows:
+> 1. Systematic single nucleotide variant (SNV) generation: For each position within the L-length input sequence, all three possible alternative nucleotide substitutions are generated. This creates a comprehensive set of SNVs covering every possible single base change from the original sequence.
+> 2. Variant scoring: Each of these generated SNVs is then scored using a chosen AlphaGenome variant scorer (as described in the Variant Scoring section) to obtain a single scalar value representing the predicted impact of that specific mutation on a particular model output (e.g., an epigenomic track or gene expression value in a specific cell type).
+> 3. Construction of an effect matrix: The resulting scalar scores for the three alternative mutations at each position are organized into an L × 4 matrix, where L is the sequence length and the 4 columns correspond to the four possible nucleotides (A, C, G, T). For each position, the entries for the three alternative (mutant) nucleotides are populated with their respective variant scores, while the entry for the original reference nucleotide at that position has a score of 0 (as it represents the baseline against which mutations are compared).
+> 4. Mean-centering: To normalize these effects, for each position i in the sequence, the mean of the three variant scores (i.e., the scores associated with mutating the original base to its three alternatives) is calculated. This mean is then subtracted from all four entries (A, C, G, T) in the matrix at that position i. Consequently, after this step, the matrix entry corresponding to the original reference base at position i now holds the value 0 − mean_of_alternative_scores.
+> 5. Computing the final contribution scores. The final contribution score for each nucleotide in the original input sequence is then taken directly from this mean-centered L × 4 matrix by selecting the value that corresponds to the actual reference base at that position. These L resulting scores (one per position) represent the influence of each reference base relative to the average of its alternatives and are typically visualized as a contribution score track or “saliency map”.
+
+> These per-position contribution scores are then visualized as sequence logos, where the height of each letter in the original reference sequence is scaled by its calculated contribution score. The value thus obtained for each position quantifies the specific contribution of the reference base to the predicted outcome, relative to the average effect of substituting it with alternative nucleotides.
+
+> Signed values are meaningful for two-sided scorers. For variant scorers producing strictly nonnegative scores, we always report non-negative values corresponding to the mean of alternative scores.
+
 ## Borzoi loss
 
-*Neither [Borzoi repo](https://github.com/calico/borzoi) nor [Borzoi-pytorch repo](https://github.com/johahi/borzoi-pytorch) explains how loss function is implemented. I can only find the following paragraph from the Borzoi paper:*
+Neither [Borzoi repo](https://github.com/calico/borzoi) nor [Borzoi-pytorch repo](https://github.com/johahi/borzoi-pytorch) explains how loss function is implemented. I can only find the following paragraph from the Borzoi paper:
 > We trained the model in a multi-task setting to predict coverage for all assays from one species, with a species-specific head attached to the shared model trunk. During training, we alternated human and mouse training batches by dynamically swapping in the corresponding species-specific head. To avoid less accurate predictions on the sequence boundaries (owing to asymmetric visibility), we cropped from each side to focus the loss computation on the center 196,608 bp. We used a Poisson loss function but decomposed the loss analogous to BPnet to separate magnitude and shape terms. Having independent Poisson distributions at each sequence position is mathematically equivalent to a single Poisson distribution representing their sum, followed by allocating the counts to sequence positions using a multinomial distribution. Thus, we apply a Poisson loss on the sum of the observed and predicted coverage and a multinomial loss on the normalized observed and predicted coverage across the sequence length. This decomposition allows us to weight the multinomial shape loss by a greater amount (five times), which we found boosts performance.
 
 ## Local Hardware Settings

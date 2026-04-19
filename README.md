@@ -81,7 +81,7 @@ LD_PRELOAD=/home/ray/miniforge3/envs/alphagenome/lib/python3.11/site-packages/nv
 ```bash
 LD_PRELOAD=/home/ray/miniforge3/envs/alphagenome/lib/python3.11/site-packages/nvidia/nccl/lib/libnccl.so.2 \
     CUDA_VISIBLE_DEVICES=0,1,2,3 \
-    python scripts/tf_ft_hybrid.py --config configs/config_bigwig_hybrid_quick.yaml
+    python scripts/tf_ft_hybrid.py --config configs/config_bigwig_hybrid.yaml
 ```
 
 ### Configuration

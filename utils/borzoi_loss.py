@@ -575,7 +575,16 @@ def cut_and_tag_loss_alphagenome(
         epsilon=epsilon,
     )
 
-    loss = jnp.mean(loss_per_batch)
+    # Per-track auxiliary output: mean over batch only → shape [N].
+    # Allows the training loop to detect head collapse / data bugs.
+    loss_per_track = jnp.mean(loss_per_batch, axis=0)
+    # Scalar total: mean over tracks (identical to jnp.mean(loss_per_batch)).
+    loss = jnp.mean(loss_per_track)
     loss = jnp.where(jnp.isfinite(loss), loss, 1e6)
     loss = jnp.maximum(loss, epsilon)
-    return loss
+    # Sanitise per-track values (NaN/Inf → 1e6) for safe host-side logging.
+    per_track_losses = jnp.where(
+        jnp.isfinite(loss_per_track), loss_per_track,
+        jnp.full_like(loss_per_track, 1e6),
+    )
+    return loss, per_track_losses

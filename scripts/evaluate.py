@@ -637,7 +637,7 @@ def main():
                         help="Skip the chr1 sanity-check inference")
     args = parser.parse_args()
 
-    run_dir     = args.run_dir
+    run_dir     = os.path.abspath(args.run_dir)
     ckpt_dir    = os.path.join(run_dir, "best_checkpoint", "model")
     metrics_csv = os.path.join(run_dir, "metrics.csv")
 

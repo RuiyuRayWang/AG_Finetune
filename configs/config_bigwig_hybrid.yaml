@@ -41,24 +41,26 @@ precision_policy: params=float32,compute=float32,output=float32
 
 
 # TRAINING HYPERPARAMETERS
-epochs: 10
-freeze_epochs: 2        # Phase 1 length: epochs to keep trunk fully frozen
+epochs: 200
+freeze_epochs: 10        # Phase 1 length: epochs to keep trunk fully frozen
 batch_size: 4
 learning_rate: 3e-4     # Peak LR used in both phases
 weight_decay: 0.04      # AdamW weight decay (paper pre-training: 0.4, distillation: 0.04)
-checkpoint_interval: 0    # Mid-epoch crash-recovery saves. Disabled: no resume logic exists, so these are never used.
+checkpoint_epoch_interval: 10  # Save epoch_NNN every N epochs (0 disables epoch snapshots; best checkpoint still saved).
 
 
 # LORA CONFIGURATION (Phase 2)
-lora_rank: 16           # LoRA rank — increase to 32/64 if Phase 2 plateaus early
-lora_alpha: 32.0        # LoRA alpha scaling factor (effective LR = alpha/rank = 2.0)
+lora_rank: 32           # LoRA rank — increase to 32/64 if Phase 2 plateaus early
+lora_alpha: 64.0        # LoRA alpha scaling factor (effective LR = alpha/rank = 2.0)
+lora_init_std: 0.02     # Init std for both A and B matrices (symmetric N(0, 0.02) init)
 
 
 # DATA & AUGMENTATION
-window_size: 8192       # 2^13 bp — covers AAV genome (~4.7 kb) with ~1.75 kb flanking on each side
+# window_size: 8192       # 2^13 bp — covers AAV genome (~4.7 kb) with ~1.75 kb flanking on each side
+window_size: 65536       # 2^16 bp — covers AAV genome (~4.7 kb) with ~31.25 kb flanking on each side
 organism_id: 1          # 0=human, 1=mouse
 augment: true
-max_shift: 256
+max_shift: 1024
 
 
 # CHROMOSOME SPLITS (mm10)
